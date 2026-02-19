@@ -131,14 +131,27 @@ class UserState:
             self.seen_keys.discard(oldest)
 
 
-def _fetch_json(url: str, *, timeout_seconds: float = 8.0) -> Any:
+def _fetch_json_with_meta(
+    url: str,
+    *,
+    timeout_seconds: float = 8.0,
+) -> Tuple[Any, Dict[str, Optional[float]]]:
     request = Request(url, headers={"Accept": "application/json", "User-Agent": "poly-fast-copy-standalone/1.0"})
     last_error: Optional[Exception] = None
     for attempt in range(max(1, int(HTTP_RETRIES))):
+        request_sent_at = time.time()
         try:
             with urlopen(request, timeout=timeout_seconds) as response:
                 payload = response.read().decode("utf-8")
-            return json.loads(payload)
+            response_received_at = time.time()
+            data = json.loads(payload)
+            parse_done_at = time.time()
+            return data, {
+                "request_sent_at_unix": request_sent_at,
+                "response_received_at_unix": response_received_at,
+                "parse_done_at_unix": parse_done_at,
+                "fetch_rtt_seconds": max(0.0, response_received_at - request_sent_at),
+            }
         except HTTPError as exc:
             last_error = exc
             if exc.code >= 500 or exc.code == 429:
@@ -153,7 +166,17 @@ def _fetch_json(url: str, *, timeout_seconds: float = 8.0) -> Any:
                 continue
     if last_error is not None:
         raise last_error
-    return []
+    return [], {
+        "request_sent_at_unix": None,
+        "response_received_at_unix": None,
+        "parse_done_at_unix": None,
+        "fetch_rtt_seconds": None,
+    }
+
+
+def _fetch_json(url: str, *, timeout_seconds: float = 8.0) -> Any:
+    data, _meta = _fetch_json_with_meta(url, timeout_seconds=timeout_seconds)
+    return data
 
 
 def _build_trades_url(
@@ -195,10 +218,21 @@ def _fetch_trades_page(
         side=side,
         taker_only=taker_only,
     )
-    data = _fetch_json(url)
+    data, fetch_meta = _fetch_json_with_meta(url)
     if not isinstance(data, list):
         return []
-    return [row for row in data if isinstance(row, dict)]
+    rows: List[Dict[str, Any]] = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        enriched = dict(row)
+        enriched["_fetch_source"] = "trades_api"
+        enriched["_fetch_request_sent_at_unix"] = fetch_meta.get("request_sent_at_unix")
+        enriched["_fetch_response_received_at_unix"] = fetch_meta.get("response_received_at_unix")
+        enriched["_fetch_parse_done_at_unix"] = fetch_meta.get("parse_done_at_unix")
+        enriched["_fetch_rtt_seconds"] = fetch_meta.get("fetch_rtt_seconds")
+        rows.append(enriched)
+    return rows
 
 
 def _fetch_recent_user_trades(
@@ -711,7 +745,7 @@ class FastClobExecutor:
         return response
 
 
-def _extract_signal(*, user: str, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _extract_signal(*, user: str, row: Dict[str, Any], seen_at_unix: Optional[float] = None) -> Optional[Dict[str, Any]]:
     row_type = str(row.get("type", "TRADE")).upper()
     if row_type and row_type != "TRADE":
         return None
@@ -729,7 +763,18 @@ def _extract_signal(*, user: str, row: Dict[str, Any]) -> Optional[Dict[str, Any
     if usdc_size is None or usdc_size <= 0:
         usdc_size = price * size
     source_tx = str(row.get("transactionHash", "")).strip().lower()
-    age = max(0.0, time.time() - ts)
+    seen_at = float(seen_at_unix) if seen_at_unix is not None else time.time()
+    age = max(0.0, seen_at - ts)
+    fetch_request_sent_at = _safe_float(row.get("_fetch_request_sent_at_unix"))
+    fetch_response_received_at = _safe_float(row.get("_fetch_response_received_at_unix"))
+    fetch_parse_done_at = _safe_float(row.get("_fetch_parse_done_at_unix"))
+    fetch_rtt = _safe_float(row.get("_fetch_rtt_seconds"))
+    api_visibility_at_response: Optional[float] = None
+    if fetch_response_received_at is not None:
+        api_visibility_at_response = max(0.0, fetch_response_received_at - ts)
+    response_to_seen: Optional[float] = None
+    if fetch_response_received_at is not None:
+        response_to_seen = max(0.0, seen_at - fetch_response_received_at)
     return {
         "source_user": user,
         "source_tx": source_tx,
@@ -740,6 +785,15 @@ def _extract_signal(*, user: str, row: Dict[str, Any]) -> Optional[Dict[str, Any
         "usdc_size": float(usdc_size),
         "timestamp": int(ts),
         "age_seconds": age,
+        "signal_seen_at_unix": seen_at,
+        "fetch_source": str(row.get("_fetch_source") or "unknown"),
+        "fetch_request_sent_at_unix": fetch_request_sent_at,
+        "fetch_response_received_at_unix": fetch_response_received_at,
+        "fetch_parse_done_at_unix": fetch_parse_done_at,
+        "fetch_rtt_seconds": fetch_rtt,
+        "api_visibility_at_response_seconds": api_visibility_at_response,
+        "api_visibility_at_seen_seconds": age,
+        "response_to_seen_seconds": response_to_seen,
     }
 
 
@@ -782,7 +836,8 @@ def _collect_user_signals_from_activity(state: UserState) -> List[Dict[str, Any]
             continue
         state.remember_key(key)
         emitted += 1
-        signal = _extract_signal(user=state.user, row=row)
+        seen_at = time.time()
+        signal = _extract_signal(user=state.user, row=row, seen_at_unix=seen_at)
         if signal is None:
             continue
         signal["signal_source"] = "poll_activity"
@@ -798,6 +853,14 @@ def _collect_user_signals_from_activity(state: UserState) -> List[Dict[str, Any]
                     "side": signal["side"],
                     "event_age_seconds": round(signal["age_seconds"], 3),
                     "max_signal_age_seconds": MAX_SIGNAL_AGE_SECONDS,
+                    "signal_seen_at_unix": round(float(signal["signal_seen_at_unix"]), 3),
+                    "fetch_source": signal.get("fetch_source"),
+                    "fetch_request_sent_at_unix": signal.get("fetch_request_sent_at_unix"),
+                    "fetch_response_received_at_unix": signal.get("fetch_response_received_at_unix"),
+                    "fetch_rtt_seconds": signal.get("fetch_rtt_seconds"),
+                    "api_visibility_at_response_seconds": signal.get("api_visibility_at_response_seconds"),
+                    "api_visibility_at_seen_seconds": round(float(signal["api_visibility_at_seen_seconds"]), 3),
+                    "response_to_seen_seconds": signal.get("response_to_seen_seconds"),
                 }
             )
             continue
@@ -862,7 +925,8 @@ def _collect_user_signals_from_trades(
         state.remember_key(key)
         emitted += 1
 
-        signal = _extract_signal(user=state.user, row=row)
+        seen_at = time.time()
+        signal = _extract_signal(user=state.user, row=row, seen_at_unix=seen_at)
         if signal is None:
             continue
         signal["signal_source"] = reason
@@ -880,6 +944,14 @@ def _collect_user_signals_from_trades(
                     "max_signal_age_seconds": MAX_SIGNAL_AGE_SECONDS,
                     "signal_source": reason,
                     "market": market,
+                    "signal_seen_at_unix": round(float(signal["signal_seen_at_unix"]), 3),
+                    "fetch_source": signal.get("fetch_source"),
+                    "fetch_request_sent_at_unix": signal.get("fetch_request_sent_at_unix"),
+                    "fetch_response_received_at_unix": signal.get("fetch_response_received_at_unix"),
+                    "fetch_rtt_seconds": signal.get("fetch_rtt_seconds"),
+                    "api_visibility_at_response_seconds": signal.get("api_visibility_at_response_seconds"),
+                    "api_visibility_at_seen_seconds": round(float(signal["api_visibility_at_seen_seconds"]), 3),
+                    "response_to_seen_seconds": signal.get("response_to_seen_seconds"),
                 }
             )
             continue
@@ -903,6 +975,12 @@ def _collect_user_signals_from_trades(
 def _aggregate_signals(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     buckets: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for s in signals:
+        seen_age = _safe_float(s.get("api_visibility_at_seen_seconds"))
+        if seen_age is None:
+            seen_age = _safe_float(s.get("age_seconds"))
+        response_age = _safe_float(s.get("api_visibility_at_response_seconds"))
+        fetch_rtt = _safe_float(s.get("fetch_rtt_seconds"))
+        response_to_seen = _safe_float(s.get("response_to_seen_seconds"))
         key = (str(s["token_id"]), str(s["side"]))
         b = buckets.get(key)
         if b is None:
@@ -921,6 +999,14 @@ def _aggregate_signals(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "last_ts": int(s["timestamp"]),
                 "first_tx": s["source_tx"],
                 "last_tx": s["source_tx"],
+                "api_visibility_seen_min_seconds": seen_age,
+                "api_visibility_seen_max_seconds": seen_age,
+                "api_visibility_response_min_seconds": response_age,
+                "api_visibility_response_max_seconds": response_age,
+                "fetch_rtt_min_seconds": fetch_rtt,
+                "fetch_rtt_max_seconds": fetch_rtt,
+                "response_to_seen_min_seconds": response_to_seen,
+                "response_to_seen_max_seconds": response_to_seen,
             }
             buckets[key] = b
         b["count"] += 1
@@ -940,6 +1026,27 @@ def _aggregate_signals(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if ts >= int(b["last_ts"]):
             b["last_ts"] = ts
             b["last_tx"] = s["source_tx"]
+
+        if seen_age is not None:
+            cur_min = _safe_float(b.get("api_visibility_seen_min_seconds"))
+            cur_max = _safe_float(b.get("api_visibility_seen_max_seconds"))
+            b["api_visibility_seen_min_seconds"] = seen_age if cur_min is None else min(cur_min, seen_age)
+            b["api_visibility_seen_max_seconds"] = seen_age if cur_max is None else max(cur_max, seen_age)
+        if response_age is not None:
+            cur_min = _safe_float(b.get("api_visibility_response_min_seconds"))
+            cur_max = _safe_float(b.get("api_visibility_response_max_seconds"))
+            b["api_visibility_response_min_seconds"] = response_age if cur_min is None else min(cur_min, response_age)
+            b["api_visibility_response_max_seconds"] = response_age if cur_max is None else max(cur_max, response_age)
+        if fetch_rtt is not None:
+            cur_min = _safe_float(b.get("fetch_rtt_min_seconds"))
+            cur_max = _safe_float(b.get("fetch_rtt_max_seconds"))
+            b["fetch_rtt_min_seconds"] = fetch_rtt if cur_min is None else min(cur_min, fetch_rtt)
+            b["fetch_rtt_max_seconds"] = fetch_rtt if cur_max is None else max(cur_max, fetch_rtt)
+        if response_to_seen is not None:
+            cur_min = _safe_float(b.get("response_to_seen_min_seconds"))
+            cur_max = _safe_float(b.get("response_to_seen_max_seconds"))
+            b["response_to_seen_min_seconds"] = response_to_seen if cur_min is None else min(cur_min, response_to_seen)
+            b["response_to_seen_max_seconds"] = response_to_seen if cur_max is None else max(cur_max, response_to_seen)
 
     now = time.time()
     out: List[Dict[str, Any]] = []
@@ -963,6 +1070,14 @@ def _aggregate_signals(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "aggregated_last_tx": b["last_tx"],
                 "oldest_signal_age_seconds": max(0.0, now - float(b["first_ts"])),
                 "latest_signal_age_seconds": max(0.0, now - float(b["last_ts"])),
+                "api_visibility_seen_min_seconds": _safe_float(b.get("api_visibility_seen_min_seconds")),
+                "api_visibility_seen_max_seconds": _safe_float(b.get("api_visibility_seen_max_seconds")),
+                "api_visibility_response_min_seconds": _safe_float(b.get("api_visibility_response_min_seconds")),
+                "api_visibility_response_max_seconds": _safe_float(b.get("api_visibility_response_max_seconds")),
+                "fetch_rtt_min_seconds": _safe_float(b.get("fetch_rtt_min_seconds")),
+                "fetch_rtt_max_seconds": _safe_float(b.get("fetch_rtt_max_seconds")),
+                "response_to_seen_min_seconds": _safe_float(b.get("response_to_seen_min_seconds")),
+                "response_to_seen_max_seconds": _safe_float(b.get("response_to_seen_max_seconds")),
             }
         )
     out.sort(key=lambda x: (x["side"], x["token_id"]))
@@ -1155,6 +1270,14 @@ def _execute_aggregated_signal(signal: Dict[str, Any], executor: FastClobExecuto
             "order_type": order_type,
             "oldest_signal_age_seconds": round(float(signal["oldest_signal_age_seconds"]), 3),
             "latest_signal_age_seconds": round(float(signal["latest_signal_age_seconds"]), 3),
+            "api_visibility_seen_min_seconds": signal.get("api_visibility_seen_min_seconds"),
+            "api_visibility_seen_max_seconds": signal.get("api_visibility_seen_max_seconds"),
+            "api_visibility_response_min_seconds": signal.get("api_visibility_response_min_seconds"),
+            "api_visibility_response_max_seconds": signal.get("api_visibility_response_max_seconds"),
+            "fetch_rtt_min_seconds": signal.get("fetch_rtt_min_seconds"),
+            "fetch_rtt_max_seconds": signal.get("fetch_rtt_max_seconds"),
+            "response_to_seen_min_seconds": signal.get("response_to_seen_min_seconds"),
+            "response_to_seen_max_seconds": signal.get("response_to_seen_max_seconds"),
             "live_quote": None if live_quote is None else round(live_quote, 6),
             "tracked_buy_order_id": tracked_buy_order_id,
             "order_response": response,
