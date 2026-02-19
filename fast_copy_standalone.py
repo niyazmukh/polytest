@@ -6,7 +6,7 @@ Behavior is intentionally simple:
 - Copies both BUY and SELL trades from target wallets.
 - Applies copy scale to source size/notional.
 - BUY-only caps: min and max USDC notional.
-- Fast signal ingest path uses `/trades` and optional market websocket triggers.
+- Fast signal ingest path polls Data API user activity at a fixed interval.
 - Adds only two lightweight protections:
   - slippage guard (quote vs source price)
   - stale BUY sweep (cancel old live BUY orders submitted by this script)
@@ -17,20 +17,13 @@ from __future__ import annotations
 import json
 import os
 import sys
-import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from queue import Empty, Full, Queue
-from socket import timeout as socket_timeout
-from typing import Any, Deque, Dict, Iterable, List, Optional, Set, Tuple
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 from polybot.data_api import fetch_activity_window, fetch_positions_snapshot
-from polybot.constants import DATA_API_BASE, HTTP_RETRIES
 from polybot.utils import make_row_key, normalize_unix, safe_stdout_flush
 
 
@@ -49,12 +42,7 @@ BOOTSTRAP_IGNORE_HISTORY = True
 QUIET_STATUS = False
 MAX_SIGNAL_AGE_SECONDS = 10.0
 
-SIGNAL_SOURCE_MODE = "poll_activity"  # poll_activity | poll_trades | hybrid_trades_wss
-TRADES_POLL_INTERVAL_SECONDS = 0.05
-TRADES_PAGE_SIZE = 200
-TRADES_MAX_PAGES = 8
-TRADES_TAKER_ONLY = False
-MAIN_LOOP_INTERVAL_SECONDS = 0.05
+POLL_INTERVAL_SECONDS = 0.05
 
 COPY_SCALE = 0.05
 BUY_MIN_USDC = 1.0
@@ -75,16 +63,6 @@ ENABLE_STALE_BUY_SWEEP = True
 STALE_BUY_ORDER_MAX_AGE_SECONDS = 2.0
 STALE_BUY_SWEEP_INTERVAL_SECONDS = 0.5
 POSITIONS_CACHE_TTL_SECONDS = 0.5
-
-ENABLE_MARKET_WSS_TRIGGER = False
-MARKET_WSS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-MARKET_WSS_PING_INTERVAL_SECONDS = 10.0
-MARKET_WSS_RECONNECT_SECONDS = 1.0
-MARKET_WSS_QUEUE_MAX = 20_000
-MARKET_WSS_MAX_TRIGGER_MARKETS_PER_CYCLE = 64
-MARKET_WSS_ASSET_REFRESH_SECONDS = 15.0
-MARKET_WSS_ASSET_LOOKBACK_SECONDS = 1800
-MARKET_WSS_ASSET_SEED_MAX_PAGES = 3
 
 CLOB_HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137
@@ -129,353 +107,6 @@ class UserState:
         while len(self.seen_order) > DEDUPE_MAX_KEYS:
             oldest = self.seen_order.popleft()
             self.seen_keys.discard(oldest)
-
-
-def _fetch_json_with_meta(
-    url: str,
-    *,
-    timeout_seconds: float = 8.0,
-) -> Tuple[Any, Dict[str, Optional[float]]]:
-    request = Request(url, headers={"Accept": "application/json", "User-Agent": "poly-fast-copy-standalone/1.0"})
-    last_error: Optional[Exception] = None
-    for attempt in range(max(1, int(HTTP_RETRIES))):
-        request_sent_at = time.time()
-        try:
-            with urlopen(request, timeout=timeout_seconds) as response:
-                payload = response.read().decode("utf-8")
-            response_received_at = time.time()
-            data = json.loads(payload)
-            parse_done_at = time.time()
-            return data, {
-                "request_sent_at_unix": request_sent_at,
-                "response_received_at_unix": response_received_at,
-                "parse_done_at_unix": parse_done_at,
-                "fetch_rtt_seconds": max(0.0, response_received_at - request_sent_at),
-            }
-        except HTTPError as exc:
-            last_error = exc
-            if exc.code >= 500 or exc.code == 429:
-                if attempt < int(HTTP_RETRIES) - 1:
-                    time.sleep(0.1 * (attempt + 1))
-                    continue
-            raise
-        except (URLError, socket_timeout, TimeoutError, ValueError, json.JSONDecodeError) as exc:
-            last_error = exc
-            if attempt < int(HTTP_RETRIES) - 1:
-                time.sleep(0.1 * (attempt + 1))
-                continue
-    if last_error is not None:
-        raise last_error
-    return [], {
-        "request_sent_at_unix": None,
-        "response_received_at_unix": None,
-        "parse_done_at_unix": None,
-        "fetch_rtt_seconds": None,
-    }
-
-
-def _fetch_json(url: str, *, timeout_seconds: float = 8.0) -> Any:
-    data, _meta = _fetch_json_with_meta(url, timeout_seconds=timeout_seconds)
-    return data
-
-
-def _build_trades_url(
-    *,
-    user: str,
-    limit: int,
-    offset: int,
-    market: Optional[str],
-    side: Optional[str],
-    taker_only: bool,
-) -> str:
-    params: Dict[str, Any] = {
-        "user": user,
-        "limit": max(1, min(int(limit), 10_000)),
-        "offset": max(0, int(offset)),
-        "takerOnly": "true" if taker_only else "false",
-    }
-    if market:
-        params["market"] = str(market)
-    if side:
-        params["side"] = str(side)
-    return f"{DATA_API_BASE}/trades?{urlencode(params)}"
-
-
-def _fetch_trades_page(
-    *,
-    user: str,
-    limit: int,
-    offset: int,
-    market: Optional[str],
-    side: Optional[str],
-    taker_only: bool,
-) -> List[Dict[str, Any]]:
-    url = _build_trades_url(
-        user=user,
-        limit=limit,
-        offset=offset,
-        market=market,
-        side=side,
-        taker_only=taker_only,
-    )
-    data, fetch_meta = _fetch_json_with_meta(url)
-    if not isinstance(data, list):
-        return []
-    rows: List[Dict[str, Any]] = []
-    for row in data:
-        if not isinstance(row, dict):
-            continue
-        enriched = dict(row)
-        enriched["_fetch_source"] = "trades_api"
-        enriched["_fetch_request_sent_at_unix"] = fetch_meta.get("request_sent_at_unix")
-        enriched["_fetch_response_received_at_unix"] = fetch_meta.get("response_received_at_unix")
-        enriched["_fetch_parse_done_at_unix"] = fetch_meta.get("parse_done_at_unix")
-        enriched["_fetch_rtt_seconds"] = fetch_meta.get("fetch_rtt_seconds")
-        rows.append(enriched)
-    return rows
-
-
-def _fetch_recent_user_trades(
-    *,
-    user: str,
-    stop_before_ts: Optional[int],
-    market: Optional[str],
-    side: Optional[str],
-    taker_only: bool,
-    page_size: int,
-    max_pages: int,
-) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    offset = 0
-    pages = 0
-    while pages < max(1, max_pages):
-        page = _fetch_trades_page(
-            user=user,
-            limit=page_size,
-            offset=offset,
-            market=market,
-            side=side,
-            taker_only=taker_only,
-        )
-        pages += 1
-        if not page:
-            break
-
-        should_stop = False
-        for row in page:
-            ts = normalize_unix(row.get("timestamp"))
-            if stop_before_ts is not None and ts is not None and ts < stop_before_ts:
-                should_stop = True
-                break
-            rows.append(row)
-
-        if should_stop or len(page) < page_size:
-            break
-        offset += page_size
-    return rows
-
-
-def _seed_user_assets_for_wss(
-    *,
-    user: str,
-    lookback_seconds: int,
-    max_pages: int,
-    page_size: int,
-) -> Set[str]:
-    cutoff_ts = int(time.time()) - max(5, int(lookback_seconds))
-    rows = _fetch_recent_user_trades(
-        user=user,
-        stop_before_ts=cutoff_ts,
-        market=None,
-        side=None,
-        taker_only=TRADES_TAKER_ONLY,
-        page_size=page_size,
-        max_pages=max_pages,
-    )
-    assets: Set[str] = set()
-    for row in rows:
-        asset = str(row.get("asset", "")).strip()
-        if asset:
-            assets.add(asset)
-    return assets
-
-
-def _iter_payload_events(payload: Any) -> Iterable[Dict[str, Any]]:
-    if isinstance(payload, dict):
-        yield payload
-        return
-    if isinstance(payload, list):
-        for item in payload:
-            if isinstance(item, dict):
-                yield item
-
-
-class MarketWssTrigger:
-    def __init__(self, assets: List[str]) -> None:
-        self._assets_lock = threading.Lock()
-        self._assets = sorted({str(asset).strip() for asset in assets if str(asset).strip()})
-        self._queue: Queue[Dict[str, Any]] = Queue(maxsize=max(1, int(MARKET_WSS_QUEUE_MAX)))
-        self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._ws: Any = None
-
-    def _assets_snapshot(self) -> List[str]:
-        with self._assets_lock:
-            return list(self._assets)
-
-    def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._thread = threading.Thread(target=self._run, name="market-wss-trigger", daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        ws = None
-        with self._assets_lock:
-            ws = self._ws
-        if ws is not None:
-            try:
-                ws.close()
-            except Exception:
-                pass
-        if self._thread is not None:
-            self._thread.join(timeout=1.5)
-
-    def update_assets(self, assets: List[str]) -> bool:
-        normalized = sorted({str(asset).strip() for asset in assets if str(asset).strip()})
-        changed = False
-        ws = None
-        with self._assets_lock:
-            if normalized != self._assets:
-                self._assets = normalized
-                changed = True
-                ws = self._ws
-        if changed and ws is not None:
-            try:
-                ws.close()
-            except Exception:
-                pass
-        return changed
-
-    def _enqueue_trigger(self, trigger: Dict[str, Any]) -> None:
-        try:
-            self._queue.put_nowait(trigger)
-            return
-        except Full:
-            pass
-        try:
-            self._queue.get_nowait()
-        except Empty:
-            return
-        try:
-            self._queue.put_nowait(trigger)
-        except Full:
-            return
-
-    def drain_markets(self, max_items: int) -> Tuple[Set[str], int]:
-        markets: Set[str] = set()
-        drained = 0
-        while drained < max(1, int(max_items)):
-            try:
-                item = self._queue.get_nowait()
-            except Empty:
-                break
-            drained += 1
-            market = str(item.get("market", "")).strip()
-            if market:
-                markets.add(market)
-        return markets, drained
-
-    def _build_ws_app(self, websocket_module: Any, assets: List[str]) -> Any:
-        def ping_loop(ws: Any) -> None:
-            interval = max(1.0, float(MARKET_WSS_PING_INTERVAL_SECONDS))
-            while True:
-                time.sleep(interval)
-                try:
-                    ws.send("PING")
-                except Exception:
-                    return
-
-        def on_open(ws: Any) -> None:
-            subscribe_payload = {"assets_ids": assets, "type": "market"}
-            try:
-                ws.send(json.dumps(subscribe_payload, separators=(",", ":")))
-            except Exception:
-                return
-            threading.Thread(target=ping_loop, args=(ws,), daemon=True).start()
-            _log_json({"event": "market_wss_subscribed", "assets_count": len(assets)})
-
-        def on_message(_ws: Any, message: str) -> None:
-            if isinstance(message, str) and message.strip().upper() == "PONG":
-                return
-            try:
-                payload = json.loads(message)
-            except Exception:
-                return
-            for event in _iter_payload_events(payload):
-                event_type = str(event.get("event_type", "")).strip().lower()
-                if event_type and event_type not in {"last_trade_price", "trade"}:
-                    continue
-                market = str(
-                    event.get("market")
-                    or event.get("conditionId")
-                    or event.get("condition_id")
-                    or ""
-                ).strip()
-                if not market:
-                    continue
-                trigger = {
-                    "source": "wss_market_trigger",
-                    "market": market,
-                    "event_timestamp": normalize_unix(event.get("timestamp")),
-                    "received_at_unix": int(time.time()),
-                    "event_type": event_type,
-                }
-                self._enqueue_trigger(trigger)
-
-        def on_error(_ws: Any, error: Any) -> None:
-            print(f"market_wss error: {error}", file=sys.stderr)
-
-        def on_close(_ws: Any, status_code: Any, close_msg: Any) -> None:
-            print(f"market_wss closed: code={status_code} msg={close_msg}", file=sys.stderr)
-
-        return websocket_module.WebSocketApp(
-            MARKET_WSS_URL,
-            on_open=on_open,
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close,
-        )
-
-    def _run(self) -> None:
-        try:
-            import websocket
-        except ModuleNotFoundError:
-            print(
-                "market_wss disabled: missing websocket-client dependency (pip install -r requirements.txt)",
-                file=sys.stderr,
-            )
-            return
-        while not self._stop_event.is_set():
-            assets = self._assets_snapshot()
-            if not assets:
-                time.sleep(0.25)
-                continue
-            ws = self._build_ws_app(websocket, assets)
-            with self._assets_lock:
-                self._ws = ws
-            try:
-                ws.run_forever()
-            except Exception as exc:
-                print(f"market_wss run_forever error: {exc}", file=sys.stderr)
-            finally:
-                with self._assets_lock:
-                    if self._ws is ws:
-                        self._ws = None
-            if self._stop_event.is_set():
-                break
-            time.sleep(max(0.05, float(MARKET_WSS_RECONNECT_SECONDS)))
 
 
 class FastClobExecutor:
@@ -881,97 +512,6 @@ def _collect_user_signals_from_activity(state: UserState) -> List[Dict[str, Any]
     return signals
 
 
-def _collect_user_signals_from_trades(
-    state: UserState,
-    *,
-    reason: str,
-    market: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    now = int(time.time())
-    if state.last_seen_ts is None:
-        if BOOTSTRAP_IGNORE_HISTORY:
-            state.last_seen_ts = now
-        start_ts = now - LOOKBACK_SECONDS
-    else:
-        start_ts = max(now - LOOKBACK_SECONDS, state.last_seen_ts - OVERLAP_SECONDS)
-
-    stop_before = (state.last_seen_ts - OVERLAP_SECONDS) if state.last_seen_ts is not None else None
-    rows = _fetch_recent_user_trades(
-        user=state.user,
-        stop_before_ts=stop_before if stop_before is not None else start_ts,
-        market=market,
-        side=None,
-        taker_only=TRADES_TAKER_ONLY,
-        page_size=TRADES_PAGE_SIZE,
-        max_pages=TRADES_MAX_PAGES,
-    )
-    rows.sort(key=lambda row: normalize_unix(row.get("timestamp")) or 0)
-
-    emitted = 0
-    fresh = 0
-    max_ts = state.last_seen_ts
-    signals: List[Dict[str, Any]] = []
-
-    for row in rows:
-        ts = normalize_unix(row.get("timestamp"))
-        if ts is None:
-            continue
-        if max_ts is None or ts > max_ts:
-            max_ts = ts
-
-        key = make_row_key(row)
-        if key in state.seen_keys:
-            continue
-        state.remember_key(key)
-        emitted += 1
-
-        seen_at = time.time()
-        signal = _extract_signal(user=state.user, row=row, seen_at_unix=seen_at)
-        if signal is None:
-            continue
-        signal["signal_source"] = reason
-        signal["trigger_market"] = market
-        if signal["side"] == "BUY" and signal["age_seconds"] > MAX_SIGNAL_AGE_SECONDS:
-            _log_json(
-                {
-                    "copy_status": "SKIPPED",
-                    "reason": "stale_signal",
-                    "source_user": signal["source_user"],
-                    "source_tx": signal["source_tx"],
-                    "token_id": signal["token_id"],
-                    "side": signal["side"],
-                    "event_age_seconds": round(signal["age_seconds"], 3),
-                    "max_signal_age_seconds": MAX_SIGNAL_AGE_SECONDS,
-                    "signal_source": reason,
-                    "market": market,
-                    "signal_seen_at_unix": round(float(signal["signal_seen_at_unix"]), 3),
-                    "fetch_source": signal.get("fetch_source"),
-                    "fetch_request_sent_at_unix": signal.get("fetch_request_sent_at_unix"),
-                    "fetch_response_received_at_unix": signal.get("fetch_response_received_at_unix"),
-                    "fetch_rtt_seconds": signal.get("fetch_rtt_seconds"),
-                    "api_visibility_at_response_seconds": signal.get("api_visibility_at_response_seconds"),
-                    "api_visibility_at_seen_seconds": round(float(signal["api_visibility_at_seen_seconds"]), 3),
-                    "response_to_seen_seconds": signal.get("response_to_seen_seconds"),
-                }
-            )
-            continue
-        signals.append(signal)
-        fresh += 1
-
-    if max_ts is not None:
-        state.last_seen_ts = max_ts
-
-    if not QUIET_STATUS:
-        print(
-            (
-                f"fast_copy trades user={state.user} source={reason} market={market or '-'} "
-                f"rows={len(rows)} emitted={emitted} fresh={fresh} last_seen={state.last_seen_ts}"
-            ),
-            file=sys.stderr,
-        )
-    return signals
-
-
 def _aggregate_signals(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     buckets: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for s in signals:
@@ -1296,16 +836,8 @@ def _validate_config() -> None:
         raise ValueError("COPY_SCALE must be > 0")
     if MAX_SIGNAL_AGE_SECONDS <= 0:
         raise ValueError("MAX_SIGNAL_AGE_SECONDS must be > 0")
-    if SIGNAL_SOURCE_MODE.lower() not in {"poll_activity", "poll_trades", "hybrid_trades_wss"}:
-        raise ValueError("SIGNAL_SOURCE_MODE must be one of: poll_activity, poll_trades, hybrid_trades_wss")
-    if TRADES_POLL_INTERVAL_SECONDS <= 0:
-        raise ValueError("TRADES_POLL_INTERVAL_SECONDS must be > 0")
-    if TRADES_PAGE_SIZE <= 0:
-        raise ValueError("TRADES_PAGE_SIZE must be > 0")
-    if TRADES_MAX_PAGES <= 0:
-        raise ValueError("TRADES_MAX_PAGES must be > 0")
-    if MAIN_LOOP_INTERVAL_SECONDS <= 0:
-        raise ValueError("MAIN_LOOP_INTERVAL_SECONDS must be > 0")
+    if POLL_INTERVAL_SECONDS <= 0:
+        raise ValueError("POLL_INTERVAL_SECONDS must be > 0")
     if BUY_ORDER_TYPE.upper() not in {"FAK", "GTC"}:
         raise ValueError("BUY_ORDER_TYPE must be FAK or GTC")
     if SELL_ORDER_TYPE.upper() not in {"FAK", "GTC"}:
@@ -1318,35 +850,6 @@ def _validate_config() -> None:
         raise ValueError("STALE_BUY_SWEEP_INTERVAL_SECONDS must be > 0")
     if POSITIONS_CACHE_TTL_SECONDS <= 0:
         raise ValueError("POSITIONS_CACHE_TTL_SECONDS must be > 0")
-    if MARKET_WSS_PING_INTERVAL_SECONDS <= 0:
-        raise ValueError("MARKET_WSS_PING_INTERVAL_SECONDS must be > 0")
-    if MARKET_WSS_RECONNECT_SECONDS <= 0:
-        raise ValueError("MARKET_WSS_RECONNECT_SECONDS must be > 0")
-    if MARKET_WSS_QUEUE_MAX <= 0:
-        raise ValueError("MARKET_WSS_QUEUE_MAX must be > 0")
-    if MARKET_WSS_MAX_TRIGGER_MARKETS_PER_CYCLE <= 0:
-        raise ValueError("MARKET_WSS_MAX_TRIGGER_MARKETS_PER_CYCLE must be > 0")
-    if MARKET_WSS_ASSET_REFRESH_SECONDS <= 0:
-        raise ValueError("MARKET_WSS_ASSET_REFRESH_SECONDS must be > 0")
-    if MARKET_WSS_ASSET_SEED_MAX_PAGES <= 0:
-        raise ValueError("MARKET_WSS_ASSET_SEED_MAX_PAGES must be > 0")
-
-
-def _seed_assets_for_users(users: List[str]) -> List[str]:
-    assets: Set[str] = set()
-    for user in users:
-        try:
-            assets.update(
-                _seed_user_assets_for_wss(
-                    user=user,
-                    lookback_seconds=MARKET_WSS_ASSET_LOOKBACK_SECONDS,
-                    max_pages=MARKET_WSS_ASSET_SEED_MAX_PAGES,
-                    page_size=TRADES_PAGE_SIZE,
-                )
-            )
-        except Exception as exc:
-            print(f"market_wss asset seed error user={user}: {exc}", file=sys.stderr)
-    return sorted(assets)
 
 
 def main() -> int:
@@ -1360,8 +863,6 @@ def main() -> int:
 
     users = [u.strip().lower() for u in USERS if str(u).strip()]
     states = [UserState(user=u) for u in users]
-    mode = SIGNAL_SOURCE_MODE.lower()
-    use_market_wss = bool(ENABLE_MARKET_WSS_TRIGGER and mode == "hybrid_trades_wss")
     executor = FastClobExecutor(
         private_key=PRIVATE_KEY,
         funder=FUNDER,
@@ -1374,8 +875,7 @@ def main() -> int:
             {
                 "event": "fast_copy_started",
                 "users": users,
-                "signal_source_mode": mode,
-                "use_market_wss": use_market_wss,
+                "signal_source_mode": "poll_activity",
                 "copy_scale": COPY_SCALE,
                 "max_signal_age_seconds": MAX_SIGNAL_AGE_SECONDS,
                 "buy_min_usdc": BUY_MIN_USDC,
@@ -1383,135 +883,60 @@ def main() -> int:
                 "buy_order_type": BUY_ORDER_TYPE,
                 "sell_order_type": SELL_ORDER_TYPE,
                 "aggregate_mode": "buy_min_price_sell_max_price",
-                "main_loop_interval_seconds": MAIN_LOOP_INTERVAL_SECONDS,
-                "trades_poll_interval_seconds": TRADES_POLL_INTERVAL_SECONDS,
-                "trades_page_size": TRADES_PAGE_SIZE,
-                "trades_max_pages": TRADES_MAX_PAGES,
+                "poll_interval_seconds": POLL_INTERVAL_SECONDS,
                 "slippage_guard_enabled": ENABLE_SLIPPAGE_GUARD,
                 "max_slippage_pct": MAX_SLIPPAGE_PCT,
                 "stale_buy_sweep_enabled": ENABLE_STALE_BUY_SWEEP,
                 "stale_buy_order_max_age_seconds": STALE_BUY_ORDER_MAX_AGE_SECONDS,
                 "stale_buy_sweep_interval_seconds": STALE_BUY_SWEEP_INTERVAL_SECONDS,
                 "positions_cache_ttl_seconds": POSITIONS_CACHE_TTL_SECONDS,
-                "market_wss_url": MARKET_WSS_URL if use_market_wss else "",
-                "market_wss_asset_lookback_seconds": MARKET_WSS_ASSET_LOOKBACK_SECONDS if use_market_wss else 0,
             },
             separators=(",", ":"),
         ),
         file=sys.stderr,
     )
 
-    market_wss: Optional[MarketWssTrigger] = None
-    if use_market_wss:
-        seed_assets = _seed_assets_for_users(users)
-        market_wss = MarketWssTrigger(seed_assets)
-        market_wss.start()
-        _log_json(
-            {
-                "event": "market_wss_started",
-                "assets_count": len(seed_assets),
-            }
-        )
-
     next_tick = time.monotonic()
-    next_trades_poll_at = time.monotonic()
     next_stale_buy_sweep_at = time.monotonic()
-    next_market_wss_asset_refresh_at = time.monotonic()
-    try:
-        while True:
-            cycle_signals: List[Dict[str, Any]] = []
-            now_mono = time.monotonic()
+    while True:
+        cycle_signals: List[Dict[str, Any]] = []
+        for state in states:
+            cycle_signals.extend(_collect_user_signals_from_activity(state))
 
-            triggered_markets: Set[str] = set()
-            drained_triggers = 0
-            if mode == "hybrid_trades_wss" and market_wss is not None:
-                triggered_markets, drained_triggers = market_wss.drain_markets(
-                    MARKET_WSS_MAX_TRIGGER_MARKETS_PER_CYCLE
-                )
-                if triggered_markets:
-                    ordered_markets = sorted(triggered_markets)
-                    for state in states:
-                        for market in ordered_markets:
-                            cycle_signals.extend(
-                                _collect_user_signals_from_trades(
-                                    state,
-                                    reason="wss_market_trigger",
-                                    market=market,
-                                )
-                            )
+        aggregated = _aggregate_signals(cycle_signals)
+        for signal in aggregated:
+            _execute_aggregated_signal(signal, executor)
 
-            if mode == "poll_activity":
-                if now_mono >= next_trades_poll_at:
-                    for state in states:
-                        cycle_signals.extend(_collect_user_signals_from_activity(state))
-                    next_trades_poll_at = now_mono + TRADES_POLL_INTERVAL_SECONDS
-            else:
-                if now_mono >= next_trades_poll_at:
-                    for state in states:
-                        cycle_signals.extend(
-                            _collect_user_signals_from_trades(
-                                state,
-                                reason="poll_trades",
-                                market=None,
-                            )
-                        )
-                    next_trades_poll_at = now_mono + TRADES_POLL_INTERVAL_SECONDS
+        if not QUIET_STATUS:
+            print(
+                f"fast_copy cycle raw_signals={len(cycle_signals)} aggregated_orders={len(aggregated)}",
+                file=sys.stderr,
+            )
 
-            aggregated = _aggregate_signals(cycle_signals)
-            for signal in aggregated:
-                _execute_aggregated_signal(signal, executor)
+        now_mono = time.monotonic()
+        if (
+            ENABLE_STALE_BUY_SWEEP
+            and STALE_BUY_ORDER_MAX_AGE_SECONDS > 0
+            and now_mono >= next_stale_buy_sweep_at
+        ):
+            sweep = executor.sweep_stale_buy_orders(max_age_seconds=STALE_BUY_ORDER_MAX_AGE_SECONDS)
+            _log_json(
+                {
+                    "copy_status": "STALE_BUY_SWEEP",
+                    "orders_scanned": int(sweep.get("orders_scanned", 0)),
+                    "orders_cancelled": int(sweep.get("orders_cancelled", 0)),
+                    "errors": int(sweep.get("errors", 0)),
+                    "max_age_seconds": STALE_BUY_ORDER_MAX_AGE_SECONDS,
+                }
+            )
+            next_stale_buy_sweep_at = now_mono + STALE_BUY_SWEEP_INTERVAL_SECONDS
 
-            if not QUIET_STATUS:
-                print(
-                    (
-                        f"fast_copy cycle raw_signals={len(cycle_signals)} aggregated_orders={len(aggregated)} "
-                        f"triggered_markets={len(triggered_markets)} drained_triggers={drained_triggers}"
-                    ),
-                    file=sys.stderr,
-                )
-
-            now_mono = time.monotonic()
-            if (
-                ENABLE_STALE_BUY_SWEEP
-                and STALE_BUY_ORDER_MAX_AGE_SECONDS > 0
-                and now_mono >= next_stale_buy_sweep_at
-            ):
-                sweep = executor.sweep_stale_buy_orders(max_age_seconds=STALE_BUY_ORDER_MAX_AGE_SECONDS)
-                _log_json(
-                    {
-                        "copy_status": "STALE_BUY_SWEEP",
-                        "orders_scanned": int(sweep.get("orders_scanned", 0)),
-                        "orders_cancelled": int(sweep.get("orders_cancelled", 0)),
-                        "errors": int(sweep.get("errors", 0)),
-                        "max_age_seconds": STALE_BUY_ORDER_MAX_AGE_SECONDS,
-                    }
-                )
-                next_stale_buy_sweep_at = now_mono + STALE_BUY_SWEEP_INTERVAL_SECONDS
-
-            if (
-                mode == "hybrid_trades_wss"
-                and market_wss is not None
-                and now_mono >= next_market_wss_asset_refresh_at
-            ):
-                refreshed_assets = _seed_assets_for_users(users)
-                if market_wss.update_assets(refreshed_assets):
-                    _log_json(
-                        {
-                            "event": "market_wss_assets_updated",
-                            "assets_count": len(refreshed_assets),
-                        }
-                    )
-                next_market_wss_asset_refresh_at = now_mono + MARKET_WSS_ASSET_REFRESH_SECONDS
-
-            next_tick += MAIN_LOOP_INTERVAL_SECONDS
-            sleep_for = next_tick - time.monotonic()
-            if sleep_for > 0:
-                time.sleep(sleep_for)
-            else:
-                next_tick = time.monotonic()
-    finally:
-        if market_wss is not None:
-            market_wss.stop()
+        next_tick += POLL_INTERVAL_SECONDS
+        sleep_for = next_tick - time.monotonic()
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        else:
+            next_tick = time.monotonic()
 
 
 if __name__ == "__main__":
