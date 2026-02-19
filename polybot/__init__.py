@@ -1,3 +1,2 @@
-from .app import main
+"""Minimal polybot package for fast_copy_standalone runtime."""
 
-__all__ = ["main"]
