@@ -1,0 +1,35 @@
+[Unit]
+Description=Polymarket Hybrid Signal Service (v2)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=poly
+Group=poly
+
+WorkingDirectory=/home/poly/poly
+ExecStart=/home/poly/poly/.venv/bin/python -m v2_hybrid_signals.run_service --no-dry-run
+
+# Environment
+EnvironmentFile=/home/poly/poly/.env.v2.local
+
+# Graceful shutdown: SIGTERM → stop_event.set() → threads drain → exit
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+# Auto-restart on failure (not on clean exit / SIGTERM)
+Restart=on-failure
+RestartSec=5
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=2G
+
+# Logging — stdout/stderr → journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=v2-signals
+
+[Install]
+WantedBy=multi-user.target

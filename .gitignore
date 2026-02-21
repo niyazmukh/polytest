@@ -1,0 +1,19 @@
+# Copy-trade secrets and operational state
+copy_config.json
+copy_idempotency.jsonl
+*.key
+*.pem
+.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.pytest_cache/
+
+# Local runtime artifacts / legacy pipeline outputs
+v2_hybrid_signals/live_pipeline_*.jsonl
+v2_hybrid_signals/live_pipeline_*.err
+v2_hybrid_signals/live_pipeline_*_meta.json
