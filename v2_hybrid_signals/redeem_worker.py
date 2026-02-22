@@ -124,13 +124,10 @@ class RelayerClient:
         self.api_secret = str(api_secret).strip()
         self.api_passphrase = str(api_passphrase).strip()
         self.signer_address = str(signer_address).strip().lower()
-        # Cloudflare WAF on relayer-v2.polymarket.com blocks POST requests
-        # with non-browser User-Agents (returns 429).  Use a browser-like UA
-        # to pass the WAF; the actual auth is in POLY_BUILDER_* headers.
         self.http = JsonHttpClient(
             host=self.host,
             timeout_seconds=timeout_seconds,
-            user_agent="Mozilla/5.0 (compatible; PolyRedeemBot/1.0)",
+            user_agent="poly-v2-redeem-relayer/1.0",
         )
 
     def _path(self, suffix: str) -> str:
@@ -222,6 +219,10 @@ class RedeemWorker:
         self.relayer_client: Optional[RelayerClient] = None
         self.relayer_builder_ready = False
         self.relayer_builder_source = "none"
+
+        # Cloudflare rate-limits rapid POST /submit (error 1015 after ~5
+        # requests).  Keep RPS low enough to stay under the limit.
+        self.relayer_submit_rate = RateGate(2.0)
 
         self.w3: Any = None
 
@@ -703,6 +704,8 @@ class RedeemWorker:
 
         now_mono = time.monotonic()
         for group in groups:
+            if self.stop_event.is_set():
+                break
             if self._should_skip_cooldown(group, now_mono):
                 cycle["groups_skipped_cooldown"] = int(cycle["groups_skipped_cooldown"]) + 1
                 self.groups_skipped_cooldown += 1
@@ -713,7 +716,9 @@ class RedeemWorker:
 
             try:
                 if self.submit_mode == "relayer":
+                    self.relayer_submit_rate.wait_turn()
                     tx_hash = self._submit_group_relayer(group=group, nonce=nonce)
+                    self.relayer_submit_rate.on_success()
                 else:
                     tx_hash = self._submit_group_direct(group=group, nonce=nonce)
 
@@ -729,6 +734,20 @@ class RedeemWorker:
                     self.submitted_tx_hashes.append(tx_hash)
 
                 self._mark_cooldown(group, now_mono)
+            except HttpStatusError as exc:
+                cycle["errors"] = int(cycle["errors"]) + 1
+                self.errors += 1
+                err_text = str(exc)
+                self.last_error = err_text
+                if exc.status == 429:
+                    # Cloudflare rate-limit — back off and retry next cycle.
+                    self.relayer_submit_rate.on_throttle()
+                    break
+                if self.submit_mode == "relayer" and (
+                    "status=401" in err_text or "invalid authorization" in err_text.lower()
+                ):
+                    cycle["auth_error"] = True
+                    break
             except Exception as exc:
                 cycle["errors"] = int(cycle["errors"]) + 1
                 self.errors += 1
