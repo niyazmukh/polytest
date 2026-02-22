@@ -43,6 +43,10 @@ class BuyConfig:
     min_price: float
     max_slippage_abs: float
     skip_book_enabled: bool
+    fak_retry_enabled: bool
+    fak_retry_max_attempts: int
+    fak_retry_delay_seconds: float
+    fak_retry_max_window_seconds: float
 
     max_usdc_per_market: float
     max_usdc_per_token: float
@@ -153,6 +157,30 @@ def parse_args(argv: _Argv = None) -> BuyConfig:
         action=argparse.BooleanOptionalAction,
         default=env_bool("BUY_SKIP_BOOK_ENABLED", True),
         help="use source-price-driven submit path; disable to use quote/book resolution path",
+    )
+    parser.add_argument(
+        "--fak-retry-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("BUY_FAK_RETRY_ENABLED", True),
+        help="retry only no-match FAK placement errors",
+    )
+    parser.add_argument(
+        "--fak-retry-max-attempts",
+        type=int,
+        default=env_int("BUY_FAK_RETRY_MAX_ATTEMPTS", 3),
+        help="total attempts for one signal (includes first try)",
+    )
+    parser.add_argument(
+        "--fak-retry-delay-seconds",
+        type=float,
+        default=env_float("BUY_FAK_RETRY_DELAY_SECONDS", 0.03),
+        help="pause between no-match retry attempts",
+    )
+    parser.add_argument(
+        "--fak-retry-max-window-seconds",
+        type=float,
+        default=env_float("BUY_FAK_RETRY_MAX_WINDOW_SECONDS", 0.35),
+        help="max elapsed wall-clock time across no-match retries",
     )
 
     parser.add_argument(
@@ -305,6 +333,10 @@ def parse_args(argv: _Argv = None) -> BuyConfig:
         min_price=min(0.9999, max(0.0, float(args.min_price))),
         max_slippage_abs=max(0.0, float(args.max_slippage_abs)),
         skip_book_enabled=bool(args.skip_book_enabled),
+        fak_retry_enabled=bool(args.fak_retry_enabled),
+        fak_retry_max_attempts=max(1, int(args.fak_retry_max_attempts)),
+        fak_retry_delay_seconds=max(0.0, float(args.fak_retry_delay_seconds)),
+        fak_retry_max_window_seconds=max(0.0, float(args.fak_retry_max_window_seconds)),
         max_usdc_per_market=max(0.0, float(args.max_usdc_per_market)),
         max_usdc_per_token=max(0.0, float(args.max_usdc_per_token)),
         allow_sell_signals=bool(args.allow_sell_signals),

@@ -36,6 +36,20 @@ def _round_up_to_tick(value: float, tick: float) -> float:
     return round(units * tick, 10)
 
 
+_FAK_NO_MATCH_ERROR_PATTERNS: tuple[str, ...] = (
+    "no orders found to match with fak order",
+    "there are no matching orders",
+    "no matching orders",
+)
+
+
+def _is_fak_no_match_error(error_text: str) -> bool:
+    text = error_text.strip().lower()
+    if not text:
+        return False
+    return any(pattern in text for pattern in _FAK_NO_MATCH_ERROR_PATTERNS)
+
+
 class BuyExecutor:
     def __init__(self, cfg: BuyConfig, price_feed: MarketPriceFeed | NullMarketPriceFeed) -> None:
         self.cfg = cfg
@@ -450,23 +464,96 @@ class BuyExecutor:
 
         try:
             submit_started = time.perf_counter()
-            order_args = _MarketOrderArgs(
-                token_id=token_id,
-                amount=round(requested_usdc, 6),
-                side="BUY",
-                price=round(worst_price, 9),
-                order_type=self.cfg.order_type,  # type: ignore[arg-type]
+            retry_enabled = (
+                self.cfg.order_type == "FAK"
+                and self.cfg.fak_retry_enabled
+                and self.cfg.fak_retry_max_attempts > 1
             )
-            signed_order = self.client.create_market_order(order_args)
-            response = self.client.post_order(signed_order, orderType=self.cfg.order_type)
+            max_attempts = self.cfg.fak_retry_max_attempts if retry_enabled else 1
+            retry_delay_seconds = max(0.0, float(self.cfg.fak_retry_delay_seconds))
+            retry_window_seconds = max(0.0, float(self.cfg.fak_retry_max_window_seconds))
 
-            decision["status"] = "submitted"
-            decision["response"] = response
+            submit_attempts = 0
+            retryable_no_match_count = 0
+            attempt_latencies_ms: List[float] = []
+            attempt_errors: List[str] = []
+            final_exc: Optional[Exception] = None
+
+            while submit_attempts < max_attempts:
+                submit_attempts += 1
+                attempt_started = time.perf_counter()
+                try:
+                    order_args = _MarketOrderArgs(
+                        token_id=token_id,
+                        amount=round(requested_usdc, 6),
+                        side="BUY",
+                        price=round(worst_price, 9),
+                        order_type=self.cfg.order_type,  # type: ignore[arg-type]
+                    )
+                    signed_order = self.client.create_market_order(order_args)
+                    response = self.client.post_order(signed_order, orderType=self.cfg.order_type)
+                    attempt_latencies_ms.append(round((time.perf_counter() - attempt_started) * 1000.0, 3))
+
+                    decision["status"] = "submitted"
+                    decision["response"] = response
+                    decision["submit_attempts"] = submit_attempts
+                    if retryable_no_match_count > 0:
+                        decision["retryable_no_match_count"] = retryable_no_match_count
+                    decision["submit_attempt_latencies_ms"] = attempt_latencies_ms
+                    decision["submit_latency_ms"] = round((time.perf_counter() - submit_started) * 1000.0, 3)
+                    decision["decision_latency_ms"] = round((time.perf_counter() - decision_started) * 1000.0, 3)
+                    self.submitted += 1
+                    self._spent_market[market_key] = spent_market + requested_usdc
+                    self._spent_token[token_id] = spent_token + requested_usdc
+                    return decision
+                except Exception as exc:
+                    final_exc = exc
+                    error_text = str(exc)
+                    attempt_errors.append(error_text)
+                    attempt_latencies_ms.append(round((time.perf_counter() - attempt_started) * 1000.0, 3))
+
+                    is_no_match = _is_fak_no_match_error(error_text)
+                    if is_no_match:
+                        retryable_no_match_count += 1
+
+                    should_retry = retry_enabled and is_no_match and submit_attempts < max_attempts
+                    if should_retry and retry_window_seconds > 0:
+                        elapsed = time.perf_counter() - submit_started
+                        should_retry = elapsed < retry_window_seconds
+
+                    if not should_retry:
+                        break
+
+                    if retry_delay_seconds > 0:
+                        sleep_seconds = retry_delay_seconds
+                        if retry_window_seconds > 0:
+                            elapsed = time.perf_counter() - submit_started
+                            remaining = max(0.0, retry_window_seconds - elapsed)
+                            if remaining <= 0:
+                                break
+                            sleep_seconds = min(sleep_seconds, remaining)
+                        if sleep_seconds > 0:
+                            time.sleep(sleep_seconds)
+
+            all_no_match = retryable_no_match_count > 0 and retryable_no_match_count >= submit_attempts
+            if all_no_match:
+                self.skipped += 1
+                decision["status"] = "no_fill"
+                decision["reason"] = "fak_no_match_exhausted"
+            else:
+                self.errors += 1
+                decision["status"] = "error"
+            decision["error"] = str(final_exc) if final_exc is not None else "order_submit_failed"
+            decision["submit_attempts"] = submit_attempts
+            decision["submit_attempt_latencies_ms"] = attempt_latencies_ms
+            if retryable_no_match_count > 0:
+                decision["retryable_no_match_count"] = retryable_no_match_count
+                if retryable_no_match_count >= submit_attempts:
+                    decision["error_kind"] = "fak_no_match_exhausted"
+            if attempt_errors:
+                decision["last_submit_error"] = attempt_errors[-1]
             decision["submit_latency_ms"] = round((time.perf_counter() - submit_started) * 1000.0, 3)
             decision["decision_latency_ms"] = round((time.perf_counter() - decision_started) * 1000.0, 3)
-            self.submitted += 1
-            self._spent_market[market_key] = spent_market + requested_usdc
-            self._spent_token[token_id] = spent_token + requested_usdc
             return decision
         except Exception as exc:
             self.errors += 1

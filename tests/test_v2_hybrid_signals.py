@@ -247,6 +247,30 @@ class _FakeReadonlyClient:
         return 0.01
 
 
+class _FakeMarketOrderArgs:
+    def __init__(self, **kwargs: object) -> None:
+        self.kwargs = dict(kwargs)
+
+
+class _FakeTradeClient:
+    def __init__(self, errors: list[str]) -> None:
+        self.errors = list(errors)
+        self.create_calls = 0
+        self.post_calls = 0
+
+    def create_market_order(self, order_args: object) -> object:
+        self.create_calls += 1
+        return order_args
+
+    def post_order(self, signed_order: object, *, orderType: str) -> dict[str, object]:
+        _ = signed_order
+        _ = orderType
+        self.post_calls += 1
+        if self.errors:
+            raise RuntimeError(self.errors.pop(0))
+        return {"ok": True, "id": f"order-{self.post_calls}"}
+
+
 class TestBuyExecutorPricing(unittest.TestCase):
     @patch.dict(os.environ, {
         "BUY_REQUIRE_LIVE_MARKET_MATCH": "0",
@@ -396,6 +420,158 @@ class TestBuyExecutorPricing(unittest.TestCase):
 
         self.assertEqual(decision.get("decision"), "skip")
         self.assertEqual(decision.get("reason"), "live_market_closing_or_closed")
+
+    @patch.dict(os.environ, {
+        "BUY_REQUIRE_LIVE_MARKET_MATCH": "0",
+        "BUY_SKIP_BOOK_ENABLED": "1",
+        "BUY_ORDER_TYPE": "FAK",
+        "BUY_FAK_RETRY_ENABLED": "1",
+        "BUY_FAK_RETRY_MAX_ATTEMPTS": "3",
+        "BUY_FAK_RETRY_DELAY_SECONDS": "0",
+        "BUY_FAK_RETRY_MAX_WINDOW_SECONDS": "1.0",
+    }, clear=False)
+    def test_fak_no_match_retry_then_submit(self) -> None:
+        from v2_hybrid_signals.buy_config import parse_args
+        from v2_hybrid_signals.buy_executor import BuyExecutor
+
+        cfg = parse_args([])
+        feed = _StubPriceFeed()
+        executor = BuyExecutor(cfg=cfg, price_feed=feed)  # type: ignore[arg-type]
+        executor.readonly_client = _FakeReadonlyClient()
+        executor.cfg.dry_run = False
+        fake_client = _FakeTradeClient(
+            [
+                "PolyApiException[status_code=400, error_message={'error': 'no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.'}]",
+                "PolyApiException[status_code=400, error_message={'error': 'there are no matching orders'}]",
+            ]
+        )
+        executor.client = fake_client
+
+        now = time.time()
+        with patch("v2_hybrid_signals.buy_executor._MarketOrderArgs", _FakeMarketOrderArgs):
+            with patch("v2_hybrid_signals.buy_executor.time.sleep", return_value=None):
+                decision = executor.process_actionable(
+                    {
+                        "match_key": "m5",
+                        "source": "orderbook_subgraph",
+                        "event_ts": now,
+                        "signal": {
+                            "side": "BUY",
+                            "token_id": "tok5",
+                            "price": 0.62,
+                            "usdc_size": 10.0,
+                            "condition_id": "cond5",
+                        },
+                    },
+                    live_markets=[],
+                )
+
+        self.assertEqual(decision.get("decision"), "buy")
+        self.assertEqual(decision.get("status"), "submitted")
+        self.assertEqual(int(decision.get("submit_attempts", 0)), 3)
+        self.assertEqual(int(decision.get("retryable_no_match_count", 0)), 2)
+        self.assertEqual(fake_client.post_calls, 3)
+
+    @patch.dict(os.environ, {
+        "BUY_REQUIRE_LIVE_MARKET_MATCH": "0",
+        "BUY_SKIP_BOOK_ENABLED": "1",
+        "BUY_ORDER_TYPE": "FAK",
+        "BUY_FAK_RETRY_ENABLED": "1",
+        "BUY_FAK_RETRY_MAX_ATTEMPTS": "4",
+        "BUY_FAK_RETRY_DELAY_SECONDS": "0",
+        "BUY_FAK_RETRY_MAX_WINDOW_SECONDS": "1.0",
+    }, clear=False)
+    def test_non_retriable_submit_error_does_not_retry(self) -> None:
+        from v2_hybrid_signals.buy_config import parse_args
+        from v2_hybrid_signals.buy_executor import BuyExecutor
+
+        cfg = parse_args([])
+        feed = _StubPriceFeed()
+        executor = BuyExecutor(cfg=cfg, price_feed=feed)  # type: ignore[arg-type]
+        executor.readonly_client = _FakeReadonlyClient()
+        executor.cfg.dry_run = False
+        fake_client = _FakeTradeClient(
+            [
+                "PolyApiException[status_code=400, error_message={'error': 'invalid amount for a marketable BUY order ($0.73), min size: $1'}]",
+            ]
+        )
+        executor.client = fake_client
+
+        now = time.time()
+        with patch("v2_hybrid_signals.buy_executor._MarketOrderArgs", _FakeMarketOrderArgs):
+            decision = executor.process_actionable(
+                {
+                    "match_key": "m6",
+                    "source": "orderbook_subgraph",
+                    "event_ts": now,
+                    "signal": {
+                        "side": "BUY",
+                        "token_id": "tok6",
+                        "price": 0.60,
+                        "usdc_size": 10.0,
+                        "condition_id": "cond6",
+                    },
+                },
+                live_markets=[],
+            )
+
+        self.assertEqual(decision.get("status"), "error")
+        self.assertEqual(int(decision.get("submit_attempts", 0)), 1)
+        self.assertEqual(int(decision.get("retryable_no_match_count", 0)), 0)
+        self.assertEqual(fake_client.post_calls, 1)
+
+    @patch.dict(os.environ, {
+        "BUY_REQUIRE_LIVE_MARKET_MATCH": "0",
+        "BUY_SKIP_BOOK_ENABLED": "1",
+        "BUY_ORDER_TYPE": "FAK",
+        "BUY_FAK_RETRY_ENABLED": "1",
+        "BUY_FAK_RETRY_MAX_ATTEMPTS": "3",
+        "BUY_FAK_RETRY_DELAY_SECONDS": "0",
+        "BUY_FAK_RETRY_MAX_WINDOW_SECONDS": "1.0",
+    }, clear=False)
+    def test_fak_no_match_exhausted_reports_error_kind(self) -> None:
+        from v2_hybrid_signals.buy_config import parse_args
+        from v2_hybrid_signals.buy_executor import BuyExecutor
+
+        cfg = parse_args([])
+        feed = _StubPriceFeed()
+        executor = BuyExecutor(cfg=cfg, price_feed=feed)  # type: ignore[arg-type]
+        executor.readonly_client = _FakeReadonlyClient()
+        executor.cfg.dry_run = False
+        fake_client = _FakeTradeClient(
+            [
+                "no orders found to match with FAK order",
+                "there are no matching orders",
+                "no orders found to match with FAK order",
+            ]
+        )
+        executor.client = fake_client
+
+        now = time.time()
+        with patch("v2_hybrid_signals.buy_executor._MarketOrderArgs", _FakeMarketOrderArgs):
+            with patch("v2_hybrid_signals.buy_executor.time.sleep", return_value=None):
+                decision = executor.process_actionable(
+                    {
+                        "match_key": "m7",
+                        "source": "orderbook_subgraph",
+                        "event_ts": now,
+                        "signal": {
+                            "side": "BUY",
+                            "token_id": "tok7",
+                            "price": 0.60,
+                            "usdc_size": 10.0,
+                            "condition_id": "cond7",
+                        },
+                    },
+                    live_markets=[],
+                )
+
+        self.assertEqual(decision.get("status"), "no_fill")
+        self.assertEqual(decision.get("reason"), "fak_no_match_exhausted")
+        self.assertEqual(decision.get("error_kind"), "fak_no_match_exhausted")
+        self.assertEqual(int(decision.get("submit_attempts", 0)), 3)
+        self.assertEqual(int(decision.get("retryable_no_match_count", 0)), 3)
+        self.assertEqual(fake_client.post_calls, 3)
 
 
 # ---------------------------------------------------------------------------
@@ -919,6 +1095,10 @@ class TestRunService(unittest.TestCase):
         return SimpleNamespace(
             dry_run=dry_run,
             skip_book_enabled=False,
+            fak_retry_enabled=True,
+            fak_retry_max_attempts=3,
+            fak_retry_delay_seconds=0.03,
+            fak_retry_max_window_seconds=0.35,
             require_market_open=True,
             market_close_guard_seconds=0.0,
             copy_scale=0.35,
