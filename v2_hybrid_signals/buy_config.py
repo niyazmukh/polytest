@@ -43,6 +43,8 @@ class BuyConfig:
     min_price: float
     max_slippage_abs: float
     skip_book_enabled: bool
+    burst_dedupe_enabled: bool
+    burst_dedupe_ttl_seconds: float
     fak_retry_enabled: bool
     fak_retry_max_attempts: int
     fak_retry_delay_seconds: float
@@ -157,6 +159,18 @@ def parse_args(argv: _Argv = None) -> BuyConfig:
         action=argparse.BooleanOptionalAction,
         default=env_bool("BUY_SKIP_BOOK_ENABLED", True),
         help="use source-price-driven submit path; disable to use quote/book resolution path",
+    )
+    parser.add_argument(
+        "--burst-dedupe-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("BUY_BURST_DEDUPE_ENABLED", True),
+        help="allow at most one order per tracked_user+token+side+event_ts burst key",
+    )
+    parser.add_argument(
+        "--burst-dedupe-ttl-seconds",
+        type=float,
+        default=env_float("BUY_BURST_DEDUPE_TTL_SECONDS", 30.0),
+        help="retention window for burst dedupe keys",
     )
     parser.add_argument(
         "--fak-retry-enabled",
@@ -333,6 +347,8 @@ def parse_args(argv: _Argv = None) -> BuyConfig:
         min_price=min(0.9999, max(0.0, float(args.min_price))),
         max_slippage_abs=max(0.0, float(args.max_slippage_abs)),
         skip_book_enabled=bool(args.skip_book_enabled),
+        burst_dedupe_enabled=bool(args.burst_dedupe_enabled),
+        burst_dedupe_ttl_seconds=max(1.0, float(args.burst_dedupe_ttl_seconds)),
         fak_retry_enabled=bool(args.fak_retry_enabled),
         fak_retry_max_attempts=max(1, int(args.fak_retry_max_attempts)),
         fak_retry_delay_seconds=max(0.0, float(args.fak_retry_delay_seconds)),

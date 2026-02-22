@@ -2,6 +2,7 @@
 
 import math
 import time
+from collections import deque
 from typing import Any, Dict, Iterable, List, Optional
 
 from .buy_config import BuyConfig
@@ -68,6 +69,8 @@ class BuyExecutor:
         self.errors = 0
 
         self._seen_match_keys: set[str] = set()
+        self._seen_burst_keys: Dict[str, float] = {}
+        self._seen_burst_order: deque[tuple[str, float]] = deque()
         self._spent_market: Dict[str, float] = {}
         self._spent_token: Dict[str, float] = {}
 
@@ -129,6 +132,16 @@ class BuyExecutor:
         payload: Dict[str, Any] = {"decision": "skip", "reason": reason}
         payload.update(extra)
         return payload
+
+    def _prune_seen_burst_keys(self, now_mono: float) -> None:
+        ttl = max(1.0, float(self.cfg.burst_dedupe_ttl_seconds))
+        while self._seen_burst_order:
+            key, stamped_at = self._seen_burst_order[0]
+            if now_mono - stamped_at <= ttl:
+                break
+            self._seen_burst_order.popleft()
+            if self._seen_burst_keys.get(key) == stamped_at:
+                del self._seen_burst_keys[key]
 
     def _token_tick_size(self, token_id: str, quote: Optional[Dict[str, Any]]) -> float:
         cached = self._tick_cache.get(token_id)
@@ -387,6 +400,17 @@ class BuyExecutor:
                 max_usdc_per_token=self.cfg.max_usdc_per_token,
             )
 
+        if self.cfg.burst_dedupe_enabled and event_ts is not None and event_ts > 0:
+            tracked_user = str(payload.get("tracked_user") or "").strip().lower()
+            if tracked_user:
+                burst_key = f"{tracked_user}|{token_id}|{side}|{int(event_ts)}"
+                now_mono = time.monotonic()
+                self._prune_seen_burst_keys(now_mono)
+                if burst_key in self._seen_burst_keys:
+                    return _skip_with_latency("duplicate_burst_key", burst_key=burst_key)
+                self._seen_burst_keys[burst_key] = now_mono
+                self._seen_burst_order.append((burst_key, now_mono))
+
         pricing_reference = "source_price"
         quote: Optional[Dict[str, Any]] = None
         best_ask: Optional[float] = None
@@ -594,6 +618,7 @@ class BuyExecutor:
             "errors": self.errors,
             "api_creds_source": self.api_creds_source,
             "seen_match_keys": len(self._seen_match_keys),
+            "seen_burst_keys": len(self._seen_burst_keys),
             "spent_market_total_usdc": round(spent_market_total, 6),
             "spent_token_total_usdc": round(spent_token_total, 6),
             "meta_prefetch_ok": self.meta_prefetch_ok,
