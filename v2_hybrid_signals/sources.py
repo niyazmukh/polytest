@@ -29,9 +29,9 @@ def _parse_price(raw: Any) -> Optional[float]:
     value = _parse_amount(raw)
     if value is None:
         return None
-    if value > 1.0:
-        # Support accidental 0..100 style prices.
-        value /= 100.0
+    # Polymarket prices are always 0..1 (probability).  Clamp rather than
+    # guessing if the value is in cents — dividing by 100 would silently
+    # corrupt legitimate edge-case values.
     return max(0.0, min(1.0, value))
 
 
@@ -130,9 +130,10 @@ class DataApiActivitySource(threading.Thread):
         )
 
         self.start_ts = int(time.time()) - int(cfg.activity_lookback_seconds)
-        self.seen_row_keys: set[str] = set()
-        self.seen_order: Deque[str] = deque()
-        self.max_seen_keys = 2_000_000
+        self.seen_row_keys: Dict[str, float] = {}  # key → monotonic ts
+        self.seen_order: Deque[tuple[str, float]] = deque()
+        self._dedupe_ttl = max(3600.0, 2.0 * float(cfg.activity_lookback_seconds))
+        self.max_seen_keys = 500_000
 
         self.polls = 0
         self.errors = 0
@@ -145,11 +146,16 @@ class DataApiActivitySource(threading.Thread):
     def _remember(self, row_key: str) -> bool:
         if row_key in self.seen_row_keys:
             return False
-        self.seen_row_keys.add(row_key)
-        self.seen_order.append(row_key)
+        now = time.monotonic()
+        cutoff = now - self._dedupe_ttl
+        while self.seen_order and self.seen_order[0][1] < cutoff:
+            old_key, _ = self.seen_order.popleft()
+            self.seen_row_keys.pop(old_key, None)
         while len(self.seen_order) > self.max_seen_keys:
-            oldest = self.seen_order.popleft()
-            self.seen_row_keys.discard(oldest)
+            old_key, _ = self.seen_order.popleft()
+            self.seen_row_keys.pop(old_key, None)
+        self.seen_row_keys[row_key] = now
+        self.seen_order.append((row_key, now))
         return True
 
     def _emit(self, signal: SourceSignal) -> None:
@@ -401,9 +407,10 @@ class DataApiActivityBatchSource(threading.Thread):
         self.active_window_seconds = max(60.0, float(cfg.activity_priority_active_window_seconds))
         self.max_probe_seconds = max(0.05, float(cfg.activity_priority_max_probe_seconds))
 
-        self.seen_row_keys: set[str] = set()
-        self.seen_order: Deque[str] = deque()
-        self.max_seen_keys = max(2_000_000, 300_000 * len(self.users))
+        self.seen_row_keys: Dict[str, float] = {}  # key → monotonic ts
+        self.seen_order: Deque[tuple[str, float]] = deque()
+        self._dedupe_ttl = max(3600.0, 2.0 * float(cfg.activity_lookback_seconds))
+        self.max_seen_keys = max(500_000, 100_000 * len(self.users))
 
         self.polls = 0
         self.errors = 0
@@ -415,11 +422,16 @@ class DataApiActivityBatchSource(threading.Thread):
         dedupe_key = f"{user}|{row_key}"
         if dedupe_key in self.seen_row_keys:
             return False
-        self.seen_row_keys.add(dedupe_key)
-        self.seen_order.append(dedupe_key)
+        now = time.monotonic()
+        cutoff = now - self._dedupe_ttl
+        while self.seen_order and self.seen_order[0][1] < cutoff:
+            old_key, _ = self.seen_order.popleft()
+            self.seen_row_keys.pop(old_key, None)
         while len(self.seen_order) > self.max_seen_keys:
-            oldest = self.seen_order.popleft()
-            self.seen_row_keys.discard(oldest)
+            old_key, _ = self.seen_order.popleft()
+            self.seen_row_keys.pop(old_key, None)
+        self.seen_row_keys[dedupe_key] = now
+        self.seen_order.append((dedupe_key, now))
         return True
 
     def _emit(self, user: str, signal: SourceSignal) -> None:
@@ -841,9 +853,10 @@ query OrderFilledEvents($user: String!, $start: BigInt!, $first: Int!) {
             user_agent="poly-v2-hybrid-subgraph/1.0",
         )
         self.start_ts = int(time.time()) - 2
-        self.seen_event_ids: set[str] = set()
-        self.seen_order: Deque[str] = deque()
-        self.max_seen_ids = 1_000_000
+        self.seen_event_ids: Dict[str, float] = {}  # id → monotonic ts
+        self.seen_order: Deque[tuple[str, float]] = deque()
+        self._dedupe_ttl = 3600.0
+        self.max_seen_ids = 500_000
 
         self.polls = 0
         self.errors = 0
@@ -859,11 +872,16 @@ query OrderFilledEvents($user: String!, $start: BigInt!, $first: Int!) {
     def _remember(self, event_id: str) -> bool:
         if event_id in self.seen_event_ids:
             return False
-        self.seen_event_ids.add(event_id)
-        self.seen_order.append(event_id)
+        now = time.monotonic()
+        cutoff = now - self._dedupe_ttl
+        while self.seen_order and self.seen_order[0][1] < cutoff:
+            old_key, _ = self.seen_order.popleft()
+            self.seen_event_ids.pop(old_key, None)
         while len(self.seen_order) > self.max_seen_ids:
-            oldest = self.seen_order.popleft()
-            self.seen_event_ids.discard(oldest)
+            old_key, _ = self.seen_order.popleft()
+            self.seen_event_ids.pop(old_key, None)
+        self.seen_event_ids[event_id] = now
+        self.seen_order.append((event_id, now))
         return True
 
     def _emit(self, signal: SourceSignal) -> None:
@@ -1147,9 +1165,10 @@ class OrderbookSubgraphBatchSource(threading.Thread):
 
         base_start = int(time.time()) - 2
         self.start_ts_by_user: Dict[str, int] = {user: base_start for user in self.users}
-        self.seen_event_ids: set[str] = set()
-        self.seen_order: Deque[str] = deque()
-        self.max_seen_ids = max(1_000_000, 250_000 * len(self.users))
+        self.seen_event_ids: Dict[str, float] = {}  # id → monotonic ts
+        self.seen_order: Deque[tuple[str, float]] = deque()
+        self._dedupe_ttl = 3600.0
+        self.max_seen_ids = max(500_000, 100_000 * len(self.users))
 
         self.polls = 0
         self.errors = 0
@@ -1204,11 +1223,16 @@ class OrderbookSubgraphBatchSource(threading.Thread):
         dedupe_key = f"{user}|{event_id}"
         if dedupe_key in self.seen_event_ids:
             return False
-        self.seen_event_ids.add(dedupe_key)
-        self.seen_order.append(dedupe_key)
+        now = time.monotonic()
+        cutoff = now - self._dedupe_ttl
+        while self.seen_order and self.seen_order[0][1] < cutoff:
+            old_key, _ = self.seen_order.popleft()
+            self.seen_event_ids.pop(old_key, None)
         while len(self.seen_order) > self.max_seen_ids:
-            oldest = self.seen_order.popleft()
-            self.seen_event_ids.discard(oldest)
+            old_key, _ = self.seen_order.popleft()
+            self.seen_event_ids.pop(old_key, None)
+        self.seen_event_ids[dedupe_key] = now
+        self.seen_order.append((dedupe_key, now))
         return True
 
     def _emit(self, signal: SourceSignal) -> None:

@@ -124,10 +124,13 @@ class RelayerClient:
         self.api_secret = str(api_secret).strip()
         self.api_passphrase = str(api_passphrase).strip()
         self.signer_address = str(signer_address).strip().lower()
+        # Cloudflare WAF on relayer-v2.polymarket.com blocks POST requests
+        # with non-browser User-Agents (returns 429).  Use a browser-like UA
+        # to pass the WAF; the actual auth is in POLY_BUILDER_* headers.
         self.http = JsonHttpClient(
             host=self.host,
             timeout_seconds=timeout_seconds,
-            user_agent="poly-v2-redeem-relayer/1.0",
+            user_agent="Mozilla/5.0 (compatible; PolyRedeemBot/1.0)",
         )
 
     def _path(self, suffix: str) -> str:

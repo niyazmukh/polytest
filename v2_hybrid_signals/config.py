@@ -162,7 +162,7 @@ def parse_args(argv: _Argv = None) -> HybridConfig:
     parser.add_argument(
         "--activity-priority-max-probe-seconds",
         type=float,
-        default=_env_float("ACTIVITY_PRIORITY_MAX_PROBE_SECONDS", 1.0),
+        default=_env_float("ACTIVITY_PRIORITY_MAX_PROBE_SECONDS", 0.15),
     )
     parser.add_argument("--activity-http-timeout-seconds", type=float, default=4.0)
     parser.add_argument("--activity-lookback-seconds", type=int, default=30)
