@@ -5,7 +5,7 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
-from .env import DEFAULT_ENV_FILE, load_env_file
+from .config_helpers import bootstrap_env_file, env_float, reload_env_file_if_changed
 
 
 _Argv = Optional[list[str]]
@@ -57,11 +57,7 @@ class RedeemConfig:
 
 
 def parse_args(argv: _Argv = None) -> RedeemConfig:
-    pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--env-file", default=os.environ.get("ENV_FILE", DEFAULT_ENV_FILE))
-    pre_args, _ = pre.parse_known_args(argv)
-    env_file = str(pre_args.env_file).strip() or DEFAULT_ENV_FILE
-    load_env_file(env_file)
+    env_file = bootstrap_env_file(argv)
 
     parser = argparse.ArgumentParser(
         description="v2 redeem worker: poll redeemable positions and submit CTF redeemPositions"
@@ -143,13 +139,13 @@ def parse_args(argv: _Argv = None) -> RedeemConfig:
     parser.add_argument(
         "--positions-limit-per-10s",
         type=float,
-        default=150.0,
+        default=env_float("POSITIONS_LIMIT_PER_10S", 150.0),
         help="Data API /positions budget (docs: 150 req / 10s)",
     )
     parser.add_argument(
         "--positions-edge-fraction",
         type=float,
-        default=0.95,
+        default=env_float("POSITIONS_EDGE_FRACTION", 0.95),
         help="fraction of /positions rate-limit budget to target",
     )
     parser.add_argument("--positions-http-timeout-seconds", type=float, default=4.0)
@@ -171,10 +167,7 @@ def parse_args(argv: _Argv = None) -> RedeemConfig:
     parser.add_argument("--legacy-gas-price-multiplier", type=float, default=1.2)
 
     args = parser.parse_args(argv)
-    cli_env_file = str(args.env_file).strip() or DEFAULT_ENV_FILE
-    if cli_env_file != env_file:
-        load_env_file(cli_env_file)
-        env_file = cli_env_file
+    env_file = reload_env_file_if_changed(env_file, str(args.env_file))
 
     runtime = None if float(args.runtime_seconds) <= 0 else float(args.runtime_seconds)
     redeem_wallet = str(args.redeem_wallet).strip().lower()

@@ -323,7 +323,7 @@ class DataApiActivitySource(threading.Thread):
             try:
                 emitted_count = self._poll_once()
                 self._on_poll_result(emitted_count)
-                if self.idle_backoff_seconds > 0:
+                if not self.cfg.activity_saturate_rps and self.idle_backoff_seconds > 0:
                     self.stop_event.wait(self.idle_backoff_seconds)
             except HttpStatusError as exc:
                 self.errors += 1
@@ -340,6 +340,7 @@ class DataApiActivitySource(threading.Thread):
             "source": "activity",
             "tracked_user": self.user,
             "batch_mode": False,
+            "saturate_rps": bool(self.cfg.activity_saturate_rps),
             "target_rps": round(self.cfg.activity_target_rps, 3),
             "polls": self.polls,
             "errors": self.errors,
@@ -458,10 +459,6 @@ class DataApiActivityBatchSource(threading.Thread):
         if forced:
             return min(forced, key=lambda u: float(self.last_polled_at_by_user.get(u, 0.0) or 0.0))
 
-        due = [user for user in self.users if now >= float(self.next_due_at_by_user.get(user, 0.0) or 0.0)]
-        if not due:
-            return None
-
         def _score(user: str) -> tuple[int, float, float]:
             active_bonus = 1 if self._is_recently_active(user, now) else 0
             due_at = float(self.next_due_at_by_user.get(user, 0.0) or 0.0)
@@ -470,6 +467,14 @@ class DataApiActivityBatchSource(threading.Thread):
             stale_for = max(0.0, now - last_polled) if last_polled > 0 else now
             return (active_bonus, overdue, stale_for)
 
+        # Full-edge mode: keep the shared endpoint hot continuously while still
+        # prioritizing recently active wallets and stale wallets for fairness.
+        if self.cfg.activity_saturate_rps:
+            return max(self.users, key=_score)
+
+        due = [user for user in self.users if now >= float(self.next_due_at_by_user.get(user, 0.0) or 0.0)]
+        if not due:
+            return None
         return max(due, key=_score)
 
     def _idle_interval_seconds(self, user: str, now: float) -> float:
@@ -684,6 +689,7 @@ class DataApiActivityBatchSource(threading.Thread):
             "tracked_users": list(self.users),
             "batch_mode": True,
             "priority_mode": "active_wallet_weighted",
+            "saturate_rps": bool(self.cfg.activity_saturate_rps),
             "activity_priority_active_window_seconds": round(self.active_window_seconds, 3),
             "activity_priority_max_probe_seconds": round(self.max_probe_seconds, 3),
             "target_rps": round(self.cfg.activity_target_rps, 3),
@@ -1090,7 +1096,7 @@ query OrderFilledEvents($user: String!, $start: BigInt!, $first: Int!) {
             try:
                 emitted_count = self._poll_once()
                 self._on_poll_result(emitted_count)
-                if self.idle_backoff_seconds > 0:
+                if not self.cfg.subgraph_saturate_rps and self.idle_backoff_seconds > 0:
                     self.stop_event.wait(self.idle_backoff_seconds)
             except HttpStatusError as exc:
                 self.errors += 1
@@ -1107,6 +1113,7 @@ query OrderFilledEvents($user: String!, $start: BigInt!, $first: Int!) {
             "source": "orderbook_subgraph",
             "tracked_user": self.user,
             "batch_mode": False,
+            "saturate_rps": bool(self.cfg.subgraph_saturate_rps),
             "target_rps": round(self.cfg.subgraph_target_rps, 3),
             "polls": self.polls,
             "errors": self.errors,
@@ -1443,7 +1450,7 @@ class OrderbookSubgraphBatchSource(threading.Thread):
             try:
                 emitted_count = self._poll_once()
                 self._on_poll_result(emitted_count)
-                if self.idle_backoff_seconds > 0:
+                if not self.cfg.subgraph_saturate_rps and self.idle_backoff_seconds > 0:
                     self.stop_event.wait(self.idle_backoff_seconds)
             except HttpStatusError as exc:
                 self.errors += 1
@@ -1460,6 +1467,7 @@ class OrderbookSubgraphBatchSource(threading.Thread):
             "source": "orderbook_subgraph",
             "tracked_users": list(self.users),
             "batch_mode": True,
+            "saturate_rps": bool(self.cfg.subgraph_saturate_rps),
             "target_rps": round(self.cfg.subgraph_target_rps, 3),
             "polls": self.polls,
             "errors": self.errors,

@@ -148,8 +148,10 @@ Detector scaling option:
 
 - `SUBGRAPH_BATCH_ENABLED` (default `1`): batch multi-wallet subgraph polling into one request loop.
 - `ACTIVITY_BATCH_ENABLED` (default `1`): use shared multi-wallet scheduler for Activity API.
+- `ACTIVITY_SATURATE_RPS` (default `1`): keep activity polling continuously at the rate-gate edge.
+- `SUBGRAPH_SATURATE_RPS` (default `1`): keep subgraph polling continuously at the rate-gate edge.
 - `ACTIVITY_PRIORITY_ACTIVE_WINDOW_SECONDS` (default `3600`): wallets active in this window are prioritized.
-- `ACTIVITY_PRIORITY_MAX_PROBE_SECONDS` (default `1.0`): max interval before probing any wallet again.
+- `ACTIVITY_PRIORITY_MAX_PROBE_SECONDS` (default `0.15`): max interval before probing any wallet again.
 - `ACTIVITY_LIMIT_PER_10S`, `ACTIVITY_EDGE_FRACTION`
 - `SUBGRAPH_LIMIT_PER_10S`, `SUBGRAPH_EDGE_FRACTION`
 - `GAMMA_LIMIT_PER_10S`, `GAMMA_EVENTS_LIMIT_PER_10S`, `GAMMA_EDGE_FRACTION`

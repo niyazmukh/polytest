@@ -86,6 +86,30 @@ class TestConfigArgv(unittest.TestCase):
         self.assertEqual(cfg.users[0], "0xwallet1")
         self.assertEqual(cfg.users[1], "0xwallet2")
 
+    @patch.dict(os.environ, {
+        "TRACKED_WALLET": "0xABCdef1234567890abcdef1234567890ABCDEF12",
+        "ACTIVITY_SATURATE_RPS": "0",
+        "SUBGRAPH_SATURATE_RPS": "0",
+    }, clear=False)
+    def test_detector_config_saturate_flags_from_env(self) -> None:
+        from v2_hybrid_signals.config import parse_args
+
+        cfg = parse_args([])
+        self.assertFalse(cfg.activity_saturate_rps)
+        self.assertFalse(cfg.subgraph_saturate_rps)
+
+    @patch.dict(os.environ, {
+        "TRACKED_WALLET": "0xABCdef1234567890abcdef1234567890ABCDEF12",
+        "ACTIVITY_SATURATE_RPS": "0",
+        "SUBGRAPH_SATURATE_RPS": "0",
+    }, clear=False)
+    def test_detector_config_cli_overrides_env(self) -> None:
+        from v2_hybrid_signals.config import parse_args
+
+        cfg = parse_args(["--activity-saturate-rps", "--subgraph-saturate-rps"])
+        self.assertTrue(cfg.activity_saturate_rps)
+        self.assertTrue(cfg.subgraph_saturate_rps)
+
     @patch.dict(os.environ, {}, clear=False)
     def test_buy_config_defaults(self) -> None:
         from v2_hybrid_signals.buy_config import parse_args
@@ -599,6 +623,55 @@ class TestSharedRateGates(unittest.TestCase):
 
         chosen = source._select_user(now)
         self.assertEqual(chosen, "0xwallet3")
+
+    @patch.dict(os.environ, {
+        "TRACKED_WALLETS": "0xwallet1,0xwallet2,0xwallet3",
+        "TRACKED_WALLET": "",
+        "ACTIVITY_BATCH_ENABLED": "1",
+        "ACTIVITY_SATURATE_RPS": "1",
+        "ACTIVITY_PRIORITY_MAX_PROBE_SECONDS": "5.0",
+        "SUBGRAPH_BATCH_ENABLED": "0",
+    }, clear=False)
+    def test_activity_batch_saturate_keeps_selecting_when_none_due(self) -> None:
+        from v2_hybrid_signals.config import parse_args
+        from v2_hybrid_signals.hybrid_detector import HybridDetector
+
+        cfg = parse_args([])
+        detector = HybridDetector(cfg)
+        source = detector.activities[0]
+
+        now = time.time()
+        for user in ("0xwallet1", "0xwallet2", "0xwallet3"):
+            source.last_polled_at_by_user[user] = now
+            source.next_due_at_by_user[user] = now + 30.0
+        source.last_signal_at_by_user["0xwallet1"] = now
+
+        chosen = source._select_user(now)
+        self.assertIsNotNone(chosen)
+
+    @patch.dict(os.environ, {
+        "TRACKED_WALLETS": "0xwallet1,0xwallet2,0xwallet3",
+        "TRACKED_WALLET": "",
+        "ACTIVITY_BATCH_ENABLED": "1",
+        "ACTIVITY_SATURATE_RPS": "0",
+        "ACTIVITY_PRIORITY_MAX_PROBE_SECONDS": "5.0",
+        "SUBGRAPH_BATCH_ENABLED": "0",
+    }, clear=False)
+    def test_activity_batch_non_saturate_waits_for_due_wallet(self) -> None:
+        from v2_hybrid_signals.config import parse_args
+        from v2_hybrid_signals.hybrid_detector import HybridDetector
+
+        cfg = parse_args([])
+        detector = HybridDetector(cfg)
+        source = detector.activities[0]
+
+        now = time.time()
+        for user in ("0xwallet1", "0xwallet2", "0xwallet3"):
+            source.last_polled_at_by_user[user] = now
+            source.next_due_at_by_user[user] = now + 30.0
+
+        chosen = source._select_user(now)
+        self.assertIsNone(chosen)
 
     @patch.dict(os.environ, {
         "TRACKED_WALLETS": "0xwallet1,0xwallet2,0xwallet3",
