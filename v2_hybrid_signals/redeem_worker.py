@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from .utils import as_bool as _as_bool, as_float as _as_float, as_int as _as_int
 
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 REDEEM_POSITIONS_SELECTOR = "82b42900"
+_QUOTA_RESET_RE = re.compile(r"resets\s+in\s+(\d+)\s+seconds?", re.IGNORECASE)
 
 # Contract addresses used by Polymarket CTF on supported chains.
 CONDITIONAL_TOKENS_BY_CHAIN: dict[int, str] = {
@@ -223,6 +225,12 @@ class RedeemWorker:
         # Cloudflare rate-limits rapid POST /submit (error 1015 after ~5
         # requests).  Keep RPS low enough to stay under the limit.
         self.relayer_submit_rate = RateGate(2.0)
+
+        # Quota tracking — relayer returns 429 with "quota exceeded: N units
+        # remaining, resets in M seconds" when the builder API key is exhausted.
+        # We skip submissions until the quota resets rather than burning cycles.
+        self._quota_paused_until: float = 0.0
+        self._quota_skip_count: int = 0
 
         self.w3: Any = None
 
@@ -673,6 +681,20 @@ class RedeemWorker:
             cycle["elapsed_seconds"] = round(time.time() - cycle_started, 4)
             return cycle
 
+        # If the relayer quota is exhausted, skip submissions until it resets.
+        if self._quota_paused_until > 0 and time.time() < self._quota_paused_until:
+            remaining = int(self._quota_paused_until - time.time())
+            cycle["quota_paused"] = True
+            cycle["quota_resets_in_seconds"] = remaining
+            self._quota_skip_count += 1
+            cycle["quota_skip_count"] = self._quota_skip_count
+            cycle["elapsed_seconds"] = round(time.time() - cycle_started, 4)
+            return cycle
+        if self._quota_paused_until > 0:
+            # Quota window has elapsed — clear state and try again.
+            self._quota_paused_until = 0.0
+            self._quota_skip_count = 0
+
         if self.cfg.dry_run:
             now_mono = time.monotonic()
             for group in groups:
@@ -740,8 +762,14 @@ class RedeemWorker:
                 err_text = str(exc)
                 self.last_error = err_text
                 if exc.status == 429:
-                    # Cloudflare rate-limit — back off and retry next cycle.
                     self.relayer_submit_rate.on_throttle()
+                    # Check for relayer quota exhaustion (application-level).
+                    m = _QUOTA_RESET_RE.search(exc.body)
+                    if m:
+                        reset_seconds = int(m.group(1))
+                        self._quota_paused_until = time.time() + reset_seconds
+                        cycle["quota_paused"] = True
+                        cycle["quota_resets_in_seconds"] = reset_seconds
                     break
                 if self.submit_mode == "relayer" and (
                     "status=401" in err_text or "invalid authorization" in err_text.lower()
@@ -784,6 +812,11 @@ class RedeemWorker:
             "relayer_url": self.cfg.relayer_url,
             "builder_auth_ready": self.relayer_builder_ready,
             "builder_auth_source": self.relayer_builder_source,
+            "quota_paused": self._quota_paused_until > 0 and time.time() < self._quota_paused_until,
+            "quota_resets_in_seconds": max(0, int(self._quota_paused_until - time.time()))
+            if self._quota_paused_until > 0
+            else None,
+            "quota_skip_count": self._quota_skip_count,
         }
 
     def run(self, emit: Any) -> int:
