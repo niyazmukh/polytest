@@ -42,7 +42,9 @@ class MarketPriceFeed:
         self._lock = threading.RLock()
         self._quote_cond = threading.Condition(self._lock)
         self._tracked_tokens: set[str] = set()
+        self._tracked_touch: Dict[str, float] = {}
         self._quotes: Dict[str, Dict[str, Any]] = {}
+        self._book_fetch_errors: Dict[str, str] = {}
 
         self._poll_thread: Optional[threading.Thread] = None
         self._ws_thread: Optional[threading.Thread] = None
@@ -62,8 +64,12 @@ class MarketPriceFeed:
         self.updated_quotes = 0
         self.last_poll_at: Optional[float] = None
         self.last_poll_rtt_seconds: Optional[float] = None
+        self.last_poll_token_count = 0
 
         self._started = False
+        self.tracked_pruned_ttl = 0
+        self.tracked_pruned_capacity = 0
+        self.last_ws_subscribe_assets = 0
 
     def start(self) -> None:
         with self._lock:
@@ -96,26 +102,80 @@ class MarketPriceFeed:
         self.stop_event.set()
         self.close()
 
+    def _prune_tracked_locked(self, now: float) -> bool:
+        changed = False
+
+        ttl = float(self.cfg.feed_track_ttl_seconds)
+        if ttl > 0:
+            cutoff = now - ttl
+            stale = [token for token, touched in self._tracked_touch.items() if touched < cutoff]
+            if stale:
+                for token in stale:
+                    self._tracked_touch.pop(token, None)
+                    self._tracked_tokens.discard(token)
+                    self._quotes.pop(token, None)
+                    self._book_fetch_errors.pop(token, None)
+                self.tracked_pruned_ttl += len(stale)
+                changed = True
+
+        cap = int(self.cfg.feed_max_tracked_tokens)
+        if cap > 0 and len(self._tracked_tokens) > cap:
+            ranked = sorted(
+                self._tracked_tokens,
+                key=lambda token: self._tracked_touch.get(token, 0.0),
+                reverse=True,
+            )
+            keep = set(ranked[:cap])
+            removed = [token for token in self._tracked_tokens if token not in keep]
+            if removed:
+                for token in removed:
+                    self._tracked_touch.pop(token, None)
+                    self._tracked_tokens.discard(token)
+                    self._quotes.pop(token, None)
+                    self._book_fetch_errors.pop(token, None)
+                self.tracked_pruned_capacity += len(removed)
+                changed = True
+
+        return changed
+
+    def _active_tokens_locked(self, limit: int) -> list[str]:
+        ranked = sorted(
+            self._tracked_tokens,
+            key=lambda token: self._tracked_touch.get(token, 0.0),
+            reverse=True,
+        )
+        if limit > 0:
+            ranked = ranked[:limit]
+        return ranked
+
     def track_token(self, token_id: str) -> None:
         token = str(token_id).strip()
         if not token or token == "0":
             return
+        changed = False
         with self._lock:
+            now = time.time()
             already = token in self._tracked_tokens
             self._tracked_tokens.add(token)
-        if not already:
+            self._tracked_touch[token] = now
+            changed = self._prune_tracked_locked(now)
+        if not already or changed:
             self._send_ws_subscribe()
 
     def track_tokens(self, token_ids: Iterable[str]) -> None:
         changed = False
         with self._lock:
+            now = time.time()
             for token_id in token_ids:
                 token = str(token_id).strip()
                 if not token or token == "0":
                     continue
+                self._tracked_touch[token] = now
                 if token not in self._tracked_tokens:
                     self._tracked_tokens.add(token)
                     changed = True
+            if self._prune_tracked_locked(now):
+                changed = True
         if changed:
             self._send_ws_subscribe()
 
@@ -152,13 +212,30 @@ class MarketPriceFeed:
         if not token:
             return None
         if self.client is None:
+            with self._lock:
+                self._book_fetch_errors[token] = "book_client_unavailable"
             return None
         try:
             book = self.client.get_order_book(token)
-        except Exception:
+        except Exception as exc:
+            with self._lock:
+                self._book_fetch_errors[token] = f"book_fetch_exception:{type(exc).__name__}:{str(exc)[:220]}"
             return None
         self._ingest_book(token, book, source="books_poll")
-        return self.get_quote(token)
+        quote = self.get_quote(token)
+        with self._lock:
+            if quote is None:
+                self._book_fetch_errors[token] = "book_without_best_bid_or_ask"
+            else:
+                self._book_fetch_errors.pop(token, None)
+        return quote
+
+    def get_last_book_fetch_error(self, token_id: str) -> Optional[str]:
+        token = str(token_id).strip()
+        if not token:
+            return None
+        with self._lock:
+            return self._book_fetch_errors.get(token)
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
@@ -168,6 +245,10 @@ class MarketPriceFeed:
             "ws_connected": bool(self.ws_connected),
             "tracked_tokens": tracked_count,
             "quotes": quote_count,
+            "last_poll_token_count": self.last_poll_token_count,
+            "last_ws_subscribe_assets": self.last_ws_subscribe_assets,
+            "tracked_pruned_ttl": self.tracked_pruned_ttl,
+            "tracked_pruned_capacity": self.tracked_pruned_capacity,
             "ws_connects": self.ws_connects,
             "ws_reconnects": self.ws_reconnects,
             "ws_errors": self.ws_errors,
@@ -241,8 +322,14 @@ class MarketPriceFeed:
 
     def _poll_loop(self) -> None:
         while not self.stop_event.is_set():
+            resubscribe = False
             with self._lock:
-                tokens = list(self._tracked_tokens)
+                now = time.time()
+                resubscribe = self._prune_tracked_locked(now)
+                tokens = self._active_tokens_locked(int(self.cfg.feed_poll_batch_size))
+                self.last_poll_token_count = len(tokens)
+            if resubscribe:
+                self._send_ws_subscribe()
             if not tokens:
                 self.stop_event.wait(0.05)
                 continue
@@ -254,7 +341,7 @@ class MarketPriceFeed:
             started = time.time()
             self.last_poll_at = started
             try:
-                params = [_BookParams(token_id=t) for t in tokens[:150]]
+                params = [_BookParams(token_id=t) for t in tokens]
                 books = self.client.get_order_books(params)
                 if isinstance(books, list):
                     for row in books:
@@ -281,7 +368,11 @@ class MarketPriceFeed:
         if ws is None:
             return
         with self._lock:
-            assets = sorted(self._tracked_tokens)
+            now = time.time()
+            self._prune_tracked_locked(now)
+            limit = int(self.cfg.feed_ws_subscribe_batch_size)
+            assets = self._active_tokens_locked(limit)
+            self.last_ws_subscribe_assets = len(assets)
         if not assets:
             return
         payload = {"assets_ids": assets, "type": "market"}
@@ -389,3 +480,74 @@ class MarketPriceFeed:
                 self.ws_reconnects += 1
             first_connect = False
             self.stop_event.wait(max(0.05, float(self.cfg.ws_reconnect_seconds)))
+
+
+class NullMarketPriceFeed:
+    """No-op price feed used when buy path does not require quotes/books."""
+
+    def __init__(self, cfg: BuyConfig, stop_event: threading.Event) -> None:
+        self.cfg = cfg
+        self.stop_event = stop_event
+        self._tracked_tokens: set[str] = set()
+
+    def start(self) -> None:
+        return
+
+    def close(self) -> None:
+        return
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        _ = timeout
+        return
+
+    def track_token(self, token_id: str) -> None:
+        token = str(token_id).strip()
+        if token:
+            self._tracked_tokens.add(token)
+
+    def track_tokens(self, token_ids: Iterable[str]) -> None:
+        for token_id in token_ids:
+            self.track_token(token_id)
+
+    def get_quote(self, token_id: str, *, max_age_seconds: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        _ = token_id
+        _ = max_age_seconds
+        return None
+
+    def wait_for_quote(self, token_id: str, *, timeout_seconds: float, max_age_seconds: float) -> Optional[Dict[str, Any]]:
+        _ = token_id
+        _ = timeout_seconds
+        _ = max_age_seconds
+        return None
+
+    def fetch_book_once(self, token_id: str) -> Optional[Dict[str, Any]]:
+        _ = token_id
+        return None
+
+    def get_last_book_fetch_error(self, token_id: str) -> Optional[str]:
+        _ = token_id
+        return None
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "disabled": True,
+            "reason": "skip_book_enabled",
+            "tracked_tokens": len(self._tracked_tokens),
+            "quotes": 0,
+            "ws_connected": False,
+            "ws_connects": 0,
+            "ws_reconnects": 0,
+            "ws_errors": 0,
+            "ws_messages": 0,
+            "last_poll_token_count": 0,
+            "last_ws_subscribe_assets": 0,
+            "tracked_pruned_ttl": 0,
+            "tracked_pruned_capacity": 0,
+            "polls": 0,
+            "poll_errors": 0,
+            "updated_quotes": 0,
+            "ws_last_connect_at_unix": None,
+            "ws_last_message_at_unix": None,
+            "last_poll_at_unix": None,
+            "last_poll_rtt_seconds": None,
+        }

@@ -144,6 +144,32 @@ Required for relayer redeem auth:
 - `BUILDER_SECRET` (or `SECRET`)
 - `BUILDER_PASSPHRASE` (or `PASSPHRASE`)
 
+Detector scaling option:
+
+- `SUBGRAPH_BATCH_ENABLED` (default `1`): batch multi-wallet subgraph polling into one request loop.
+- `ACTIVITY_BATCH_ENABLED` (default `1`): use shared multi-wallet scheduler for Activity API.
+- `ACTIVITY_PRIORITY_ACTIVE_WINDOW_SECONDS` (default `3600`): wallets active in this window are prioritized.
+- `ACTIVITY_PRIORITY_MAX_PROBE_SECONDS` (default `1.0`): max interval before probing any wallet again.
+- `ACTIVITY_LIMIT_PER_10S`, `ACTIVITY_EDGE_FRACTION`
+- `SUBGRAPH_LIMIT_PER_10S`, `SUBGRAPH_EDGE_FRACTION`
+- `GAMMA_LIMIT_PER_10S`, `GAMMA_EVENTS_LIMIT_PER_10S`, `GAMMA_EDGE_FRACTION`
+
+Useful live-buy tuning knobs (optional):
+
+- `BUY_COPY_SCALE` (default `0.10`)
+- `BUY_MIN_ORDER_USDC` (default `1.0`)
+- `BUY_MAX_SIGNAL_AGE_SECONDS` (default `7.0`)
+- `BUY_SKIP_BOOK_ENABLED` (default `1`)
+- `BUY_REQUIRE_MARKET_OPEN` (default `1`)
+- `BUY_MARKET_CLOSE_GUARD_SECONDS` (default `0.0`)
+- `BUY_QUOTE_WAIT_TIMEOUT_SECONDS` (default `0.12`)
+- `BUY_QUOTE_STALE_AFTER_SECONDS` (default `0.8`)
+- `BUY_QUOTE_FALLBACK_STALE_SECONDS` (default `2.5`)
+- `BUY_FEED_MAX_TRACKED_TOKENS` (default `256`)
+- `BUY_FEED_TRACK_TTL_SECONDS` (default `1800`)
+- `BUY_FEED_POLL_BATCH_SIZE` (default `120`)
+- `BUY_FEED_WS_SUBSCRIBE_BATCH_SIZE` (default `256`)
+
 ## Notes
 
 - The `_recovered_fragments` folder contains non-runtime forensic fragments.
@@ -155,5 +181,5 @@ Required for relayer redeem auth:
 python -m pytest tests/test_v2_hybrid_signals.py -v
 ```
 
-16 offline tests covering: shared rate gates, signal callback wiring,
+24 offline tests covering: shared rate gates, signal callback wiring,
 config-from-env parsing, prune-stale logic, stop-event propagation.

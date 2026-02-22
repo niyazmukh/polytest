@@ -5,7 +5,7 @@ import time
 from typing import Any, Dict, Iterable, List, Optional
 
 from .buy_config import BuyConfig
-from .price_feed import MarketPriceFeed
+from .price_feed import MarketPriceFeed, NullMarketPriceFeed
 from .utils import as_float as _as_float
 
 try:
@@ -37,7 +37,7 @@ def _round_up_to_tick(value: float, tick: float) -> float:
 
 
 class BuyExecutor:
-    def __init__(self, cfg: BuyConfig, price_feed: MarketPriceFeed) -> None:
+    def __init__(self, cfg: BuyConfig, price_feed: MarketPriceFeed | NullMarketPriceFeed) -> None:
         self.cfg = cfg
         self.price_feed = price_feed
 
@@ -87,6 +87,8 @@ class BuyExecutor:
                 self.api_creds_source = "derived"
 
     def prefetch_market_tokens(self, live_markets: Iterable[Dict[str, Any]]) -> None:
+        if self.cfg.skip_book_enabled:
+            return
         for market in live_markets:
             tokens = market.get("tokens")
             if not isinstance(tokens, list):
@@ -100,6 +102,8 @@ class BuyExecutor:
                 self.prewarm_token(token_id)
 
     def prewarm_token(self, token_id: str) -> None:
+        if self.cfg.skip_book_enabled:
+            return
         try:
             self.price_feed.track_token(token_id)
             self.meta_prefetch_ok += 1
@@ -136,9 +140,13 @@ class BuyExecutor:
 
         return 0.01
 
-    def _signal_matches_live_market(self, signal: Dict[str, Any], live_markets: List[Dict[str, Any]]) -> bool:
+    def _find_matching_live_market(
+        self,
+        signal: Dict[str, Any],
+        live_markets: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
         if not live_markets:
-            return False
+            return None
         signal_condition = str(signal.get("condition_id") or "").strip().lower()
         signal_slug = str(signal.get("slug") or "").strip().lower()
         signal_token = str(signal.get("token_id") or "").strip()
@@ -147,17 +155,45 @@ class BuyExecutor:
             condition = str(market.get("condition_id") or "").strip().lower()
             slug = str(market.get("slug") or "").strip().lower()
             if signal_condition and condition and signal_condition == condition:
-                return True
+                return market
             if signal_slug and slug and signal_slug == slug:
-                return True
+                return market
             tokens = market.get("tokens")
             if signal_token and isinstance(tokens, list):
                 for token in tokens:
                     if not isinstance(token, dict):
                         continue
                     if str(token.get("token_id") or "").strip() == signal_token:
-                        return True
-        return False
+                        return market
+        return None
+
+    def _is_market_open(self, market: Dict[str, Any]) -> tuple[bool, Dict[str, Any]]:
+        now = time.time()
+        details: Dict[str, Any] = {}
+
+        active = market.get("active")
+        if isinstance(active, bool):
+            details["market_active"] = active
+            if not active:
+                return False, details
+
+        closed = market.get("closed")
+        if isinstance(closed, bool):
+            details["market_closed"] = closed
+            if closed:
+                return False, details
+
+        end_ts = _as_float(market.get("end_ts"))
+        if end_ts is not None and end_ts > 0:
+            details["market_end_ts"] = round(float(end_ts), 3)
+            seconds_to_end = float(end_ts) - now
+            details["seconds_to_end"] = round(seconds_to_end, 3)
+            guard = max(0.0, float(self.cfg.market_close_guard_seconds))
+            if now + guard >= float(end_ts):
+                details["market_close_guard_seconds"] = round(guard, 3)
+                return False, details
+
+        return True, details
 
     def _requested_usdc(self, signal: Dict[str, Any]) -> tuple[float, float, str]:
         source_usdc = _as_float(signal.get("usdc_size")) or 0.0
@@ -171,7 +207,9 @@ class BuyExecutor:
             requested = min(requested, float(self.cfg.max_single_order_usdc))
         return requested, source_usdc, sizing_mode
 
-    def _resolve_quote(self, token_id: str, source_price: Optional[float]) -> Optional[Dict[str, Any]]:
+    def _resolve_quote(self, token_id: str, source_price: Optional[float]) -> tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        started = time.perf_counter()
+        meta: Dict[str, Any] = {}
         self.price_feed.track_token(token_id)
         quote = self.price_feed.wait_for_quote(
             token_id,
@@ -179,15 +217,19 @@ class BuyExecutor:
             max_age_seconds=self.cfg.quote_stale_after_seconds,
         )
         if quote is not None:
-            return quote
+            meta["quote_source"] = str(quote.get("source") or "wait_for_quote")
+            meta["quote_resolve_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
+            return quote, meta
 
         quote = self.price_feed.get_quote(token_id, max_age_seconds=self.cfg.quote_fallback_stale_seconds)
         if quote is not None:
-            return quote
+            meta["quote_source"] = str(quote.get("source") or "cached_quote")
+            meta["quote_resolve_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
+            return quote, meta
 
         # In dry-run mode, allow source price fallback so replay tests still produce decisions.
         if self.cfg.dry_run and source_price is not None:
-            return {
+            quote = {
                 "token_id": token_id,
                 "best_bid": source_price,
                 "best_ask": source_price,
@@ -195,8 +237,26 @@ class BuyExecutor:
                 "updated_at_unix": time.time(),
                 "source": "source_price_fallback",
             }
+            meta["quote_source"] = "source_price_fallback"
+            meta["quote_resolve_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
+            return quote, meta
 
-        return self.price_feed.fetch_book_once(token_id)
+        quote = self.price_feed.fetch_book_once(token_id)
+        meta["quote_resolve_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
+        if quote is not None:
+            meta["quote_source"] = str(quote.get("source") or "books_poll")
+            return quote, meta
+
+        meta["quote_source"] = "none"
+        fetch_error = self.price_feed.get_last_book_fetch_error(token_id)
+        if fetch_error:
+            meta["book_fetch_error"] = fetch_error
+        feed_diag = self.price_feed.snapshot()
+        meta["feed_ws_connected"] = bool(feed_diag.get("ws_connected"))
+        meta["feed_tracked_tokens"] = int(feed_diag.get("tracked_tokens", 0) or 0)
+        meta["feed_last_poll_token_count"] = int(feed_diag.get("last_poll_token_count", 0) or 0)
+        meta["feed_poll_errors"] = int(feed_diag.get("poll_errors", 0) or 0)
+        return None, meta
 
     def process_actionable(
         self,
@@ -204,17 +264,32 @@ class BuyExecutor:
         *,
         live_markets: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
+        decision_started = time.perf_counter()
+        queue_lag_seconds = _as_float(payload.get("_queue_lag_seconds"))
+        event_ts = _as_float(payload.get("event_ts"))
+
+        def _skip_with_latency(reason: str, **extra: Any) -> Dict[str, Any]:
+            decision = self._skip(reason, **extra)
+            if queue_lag_seconds is not None and queue_lag_seconds >= 0:
+                if "queue_lag_seconds" not in decision:
+                    decision["queue_lag_seconds"] = round(queue_lag_seconds, 4)
+            if event_ts is not None and event_ts > 0:
+                if "signal_age_seconds" not in decision:
+                    decision["signal_age_seconds"] = round(max(0.0, time.time() - event_ts), 4)
+            decision["decision_latency_ms"] = round((time.perf_counter() - decision_started) * 1000.0, 3)
+            return decision
+
         match_key = str(payload.get("match_key") or "").strip()
         if not match_key:
-            return self._skip("missing_match_key")
+            return _skip_with_latency("missing_match_key")
         if match_key in self._seen_match_keys:
-            return self._skip("duplicate_match_key", match_key=match_key)
+            return _skip_with_latency("duplicate_match_key", match_key=match_key)
         self._seen_match_keys.add(match_key)
         self.accepted += 1
 
         source = str(payload.get("source") or "").strip().lower()
         if source and source not in self.cfg.actionable_sources:
-            return self._skip(
+            return _skip_with_latency(
                 "source_not_allowed",
                 source=source,
                 allowed_sources=list(self.cfg.actionable_sources),
@@ -222,17 +297,16 @@ class BuyExecutor:
 
         signal = payload.get("signal")
         if not isinstance(signal, dict):
-            return self._skip("malformed_actionable_signal")
+            return _skip_with_latency("malformed_actionable_signal")
 
         side = str(signal.get("side") or "").strip().upper()
         if side != "BUY" and not self.cfg.allow_sell_signals:
-            return self._skip("non_buy_signal")
+            return _skip_with_latency("non_buy_signal")
 
-        event_ts = _as_float(payload.get("event_ts"))
         if self.cfg.max_signal_age_seconds > 0 and event_ts is not None and event_ts > 0:
             age = max(0.0, time.time() - event_ts)
             if age > self.cfg.max_signal_age_seconds:
-                return self._skip(
+                return _skip_with_latency(
                     "signal_too_old",
                     signal_age_seconds=round(age, 4),
                     max_signal_age_seconds=self.cfg.max_signal_age_seconds,
@@ -240,7 +314,7 @@ class BuyExecutor:
 
         source_price = _normalize_prob(signal.get("price"))
         if source_price is not None and source_price < self.cfg.min_source_signal_price:
-            return self._skip(
+            return _skip_with_latency(
                 "source_price_below_min",
                 source_price=source_price,
                 min_source_signal_price=self.cfg.min_source_signal_price,
@@ -248,15 +322,20 @@ class BuyExecutor:
 
         token_id = str(signal.get("token_id") or "").strip()
         if not token_id:
-            return self._skip("missing_token_id")
+            return _skip_with_latency("missing_token_id")
 
+        matched_live_market: Optional[Dict[str, Any]] = self._find_matching_live_market(signal, list(live_markets or []))
         if self.cfg.actionable_require_live_market_match:
-            if not self._signal_matches_live_market(signal, list(live_markets or [])):
-                return self._skip("live_market_mismatch")
+            if matched_live_market is None:
+                return _skip_with_latency("live_market_mismatch")
+        if self.cfg.require_market_open and matched_live_market is not None:
+            market_open, market_meta = self._is_market_open(matched_live_market)
+            if not market_open:
+                return _skip_with_latency("live_market_closing_or_closed", **market_meta)
 
         requested_usdc, source_usdc, sizing_mode = self._requested_usdc(signal)
         if requested_usdc < self.cfg.min_order_usdc:
-            return self._skip(
+            return _skip_with_latency(
                 "order_too_small_after_sizing",
                 requested_usdc=round(requested_usdc, 6),
                 source_usdc=round(source_usdc, 6),
@@ -270,7 +349,7 @@ class BuyExecutor:
         spent_token = self._spent_token.get(token_id, 0.0)
 
         if self.cfg.max_usdc_per_market > 0 and spent_market + requested_usdc > self.cfg.max_usdc_per_market + 1e-12:
-            return self._skip(
+            return _skip_with_latency(
                 "market_budget_exceeded",
                 market_key=market_key,
                 spent_market=round(spent_market, 6),
@@ -278,7 +357,7 @@ class BuyExecutor:
                 max_usdc_per_market=self.cfg.max_usdc_per_market,
             )
         if self.cfg.max_usdc_per_token > 0 and spent_token + requested_usdc > self.cfg.max_usdc_per_token + 1e-12:
-            return self._skip(
+            return _skip_with_latency(
                 "token_budget_exceeded",
                 token_id=token_id,
                 spent_token=round(spent_token, 6),
@@ -286,25 +365,42 @@ class BuyExecutor:
                 max_usdc_per_token=self.cfg.max_usdc_per_token,
             )
 
-        quote = self._resolve_quote(token_id, source_price)
-        if quote is None:
-            return self._skip("quote_unavailable")
-
-        best_ask = _normalize_prob(quote.get("best_ask"))
-        if best_ask is None:
-            return self._skip("quote_missing_best_ask")
-
-        if best_ask < self.cfg.min_price or best_ask > self.cfg.max_price:
-            return self._skip(
-                "best_ask_out_of_range",
-                best_ask=best_ask,
-                min_price=self.cfg.min_price,
-                max_price=self.cfg.max_price,
-            )
+        pricing_reference = "source_price"
+        quote: Optional[Dict[str, Any]] = None
+        best_ask: Optional[float] = None
+        quote_meta: Dict[str, Any] = {}
+        if self.cfg.skip_book_enabled:
+            # Fast path: use source trade price as reference and set worst-price cap.
+            if source_price is None:
+                return _skip_with_latency("source_price_unavailable")
+            if source_price < self.cfg.min_price or source_price > self.cfg.max_price:
+                return _skip_with_latency(
+                    "source_price_out_of_range",
+                    source_price=source_price,
+                    min_price=self.cfg.min_price,
+                    max_price=self.cfg.max_price,
+                )
+            best_ask = source_price
+        else:
+            pricing_reference = "best_ask_quote"
+            quote, quote_meta = self._resolve_quote(token_id, source_price)
+            if quote is None:
+                return _skip_with_latency("quote_unavailable", **quote_meta)
+            best_ask = _normalize_prob(quote.get("best_ask"))
+            if best_ask is None:
+                return _skip_with_latency("quote_without_best_ask", **quote_meta)
+            if best_ask < self.cfg.min_price or best_ask > self.cfg.max_price:
+                return _skip_with_latency(
+                    "quote_price_out_of_range",
+                    best_ask=best_ask,
+                    min_price=self.cfg.min_price,
+                    max_price=self.cfg.max_price,
+                    **quote_meta,
+                )
 
         tick_size = self._token_tick_size(token_id, quote)
-        worst_price = min(self.cfg.max_price, best_ask + self.cfg.max_slippage_abs)
-        worst_price = max(best_ask, worst_price)
+        worst_price = min(self.cfg.max_price, float(best_ask) + self.cfg.max_slippage_abs)
+        worst_price = max(float(best_ask), worst_price)
         worst_price = _round_up_to_tick(worst_price, tick_size)
         worst_price = min(self.cfg.max_price, worst_price)
 
@@ -316,7 +412,8 @@ class BuyExecutor:
             "condition_id": condition_id or None,
             "source": source,
             "source_signal_price": source_price,
-            "best_ask": round(best_ask, 9),
+            "pricing_reference": pricing_reference,
+            "best_ask_reference": round(float(best_ask), 9),
             "order_usdc": round(requested_usdc, 6),
             "requested_usdc": round(requested_usdc, 6),
             "source_usdc": round(source_usdc, 6),
@@ -325,24 +422,34 @@ class BuyExecutor:
             "worst_price": round(worst_price, 9),
             "tick_size": round(tick_size, 6),
         }
+        if quote_meta:
+            decision.update(quote_meta)
+        if event_ts is not None and event_ts > 0:
+            decision["signal_age_seconds"] = round(max(0.0, time.time() - event_ts), 4)
+        if queue_lag_seconds is not None and queue_lag_seconds >= 0:
+            decision["queue_lag_seconds"] = round(queue_lag_seconds, 4)
 
         if self.cfg.dry_run:
             decision["status"] = "dry_run_ok"
+            decision["decision_latency_ms"] = round((time.perf_counter() - decision_started) * 1000.0, 3)
             return decision
 
         if self.client is None:
             self.errors += 1
             decision["status"] = "error"
             decision["error"] = "trading_client_unavailable"
+            decision["decision_latency_ms"] = round((time.perf_counter() - decision_started) * 1000.0, 3)
             return decision
 
         if _MarketOrderArgs is None:
             self.errors += 1
             decision["status"] = "error"
             decision["error"] = f"py_clob_client_types_unavailable: {_CLOB_IMPORT_ERROR}"
+            decision["decision_latency_ms"] = round((time.perf_counter() - decision_started) * 1000.0, 3)
             return decision
 
         try:
+            submit_started = time.perf_counter()
             order_args = _MarketOrderArgs(
                 token_id=token_id,
                 amount=round(requested_usdc, 6),
@@ -355,6 +462,8 @@ class BuyExecutor:
 
             decision["status"] = "submitted"
             decision["response"] = response
+            decision["submit_latency_ms"] = round((time.perf_counter() - submit_started) * 1000.0, 3)
+            decision["decision_latency_ms"] = round((time.perf_counter() - decision_started) * 1000.0, 3)
             self.submitted += 1
             self._spent_market[market_key] = spent_market + requested_usdc
             self._spent_token[token_id] = spent_token + requested_usdc
@@ -363,6 +472,7 @@ class BuyExecutor:
             self.errors += 1
             decision["status"] = "error"
             decision["error"] = str(exc)
+            decision["decision_latency_ms"] = round((time.perf_counter() - decision_started) * 1000.0, 3)
             return decision
 
     def snapshot(self) -> Dict[str, Any]:

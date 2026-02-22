@@ -25,7 +25,7 @@ from .buy_config import parse_args as _parse_buy_args
 from .buy_executor import BuyExecutor
 from .config import parse_args as _parse_detector_args
 from .hybrid_detector import HybridDetector
-from .price_feed import MarketPriceFeed
+from .price_feed import MarketPriceFeed, NullMarketPriceFeed
 from .redeem_config import parse_args as _parse_redeem_args
 from .redeem_worker import RedeemWorker
 from .utils import safe_stdout_flush
@@ -56,7 +56,7 @@ def _extract_live_markets(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def _prewarm_live_markets(
     executor: BuyExecutor,
-    feed: MarketPriceFeed,
+    feed: MarketPriceFeed | NullMarketPriceFeed,
     live_markets: List[Dict[str, Any]],
 ) -> None:
     executor.prefetch_market_tokens(live_markets)
@@ -122,7 +122,10 @@ class ServiceRunner:
         self.buy_cfg = _parse_buy_args(buy_argv)
 
         # Buy engine (price feed + executor).
-        self.price_feed = MarketPriceFeed(cfg=self.buy_cfg, stop_event=self.stop_event)
+        if self.buy_cfg.skip_book_enabled:
+            self.price_feed = NullMarketPriceFeed(cfg=self.buy_cfg, stop_event=self.stop_event)
+        else:
+            self.price_feed = MarketPriceFeed(cfg=self.buy_cfg, stop_event=self.stop_event)
         self.buy_executor = BuyExecutor(cfg=self.buy_cfg, price_feed=self.price_feed)
 
         # Detector with shared stop_event and in-process signal callback.
@@ -159,11 +162,12 @@ class ServiceRunner:
             if next_live:
                 with self._live_markets_lock:
                     self.live_markets = next_live
-                _prewarm_live_markets(
-                    executor=self.buy_executor,
-                    feed=self.price_feed,
-                    live_markets=next_live,
-                )
+                if not self.buy_cfg.skip_book_enabled:
+                    _prewarm_live_markets(
+                        executor=self.buy_executor,
+                        feed=self.price_feed,
+                        live_markets=next_live,
+                    )
             return
 
         if event != "ACTIONABLE_SIGNAL":
@@ -173,11 +177,13 @@ class ServiceRunner:
         signal_data = payload.get("signal")
         if isinstance(signal_data, dict):
             token_id = str(signal_data.get("token_id") or "").strip()
-            if token_id:
+            if token_id and not self.buy_cfg.skip_book_enabled:
                 self.price_feed.track_token(token_id)
 
         try:
-            self._actionable_queue.put_nowait(payload)
+            queued = dict(payload)
+            queued["_enqueued_at_unix"] = time.time()
+            self._actionable_queue.put_nowait(queued)
             self.actionable_enqueued += 1
         except Full:
             self.actionable_dropped += 1
@@ -202,6 +208,14 @@ class ServiceRunner:
                 continue
 
             try:
+                enqueued_at = payload.get("_enqueued_at_unix")
+                try:
+                    enqueued_at_unix = float(enqueued_at) if enqueued_at is not None else None
+                except Exception:
+                    enqueued_at_unix = None
+                if enqueued_at_unix is not None and enqueued_at_unix > 0:
+                    payload["_queue_lag_seconds"] = max(0.0, time.time() - enqueued_at_unix)
+
                 with self._live_markets_lock:
                     live_markets = list(self.live_markets)
                 decision = self.buy_executor.process_actionable(payload, live_markets=live_markets)
@@ -248,7 +262,28 @@ class ServiceRunner:
         _emit({
             "event": "SERVICE_START",
             "tracked_wallets": list(self.detector_cfg.users),
+            "activity_batch_enabled": self.detector_cfg.activity_batch_enabled,
+            "activity_priority_active_window_seconds": self.detector_cfg.activity_priority_active_window_seconds,
+            "activity_priority_max_probe_seconds": self.detector_cfg.activity_priority_max_probe_seconds,
+            "subgraph_batch_enabled": self.detector_cfg.subgraph_batch_enabled,
+            "activity_target_rps": round(self.detector_cfg.activity_target_rps, 6),
+            "subgraph_target_rps": round(self.detector_cfg.subgraph_target_rps, 6),
+            "gamma_market_target_rps": round(self.detector_cfg.gamma_target_rps, 6),
+            "gamma_events_target_rps": round(self.detector_cfg.gamma_events_target_rps, 6),
             "buy_dry_run": self.buy_cfg.dry_run,
+            "buy_copy_scale": self.buy_cfg.copy_scale,
+            "buy_min_order_usdc": self.buy_cfg.min_order_usdc,
+            "buy_max_signal_age_seconds": self.buy_cfg.max_signal_age_seconds,
+            "buy_skip_book_enabled": self.buy_cfg.skip_book_enabled,
+            "buy_require_market_open": self.buy_cfg.require_market_open,
+            "buy_market_close_guard_seconds": self.buy_cfg.market_close_guard_seconds,
+            "buy_quote_wait_timeout_seconds": self.buy_cfg.quote_wait_timeout_seconds,
+            "buy_quote_stale_after_seconds": self.buy_cfg.quote_stale_after_seconds,
+            "buy_quote_fallback_stale_seconds": self.buy_cfg.quote_fallback_stale_seconds,
+            "buy_feed_max_tracked_tokens": self.buy_cfg.feed_max_tracked_tokens,
+            "buy_feed_track_ttl_seconds": self.buy_cfg.feed_track_ttl_seconds,
+            "buy_feed_poll_batch_size": self.buy_cfg.feed_poll_batch_size,
+            "buy_feed_ws_subscribe_batch_size": self.buy_cfg.feed_ws_subscribe_batch_size,
             "has_redeem": self.redeem_worker is not None,
             "redeem_disabled_reason": self.redeem_disabled_reason,
             "runtime_seconds": self.detector_cfg.runtime_seconds,
@@ -317,7 +352,7 @@ def main() -> int:
         help="Path to .env file (default: .env.v2.local)",
     )
     parser.add_argument(
-        "--dry-run", action="store_true", default=False,
+        "--dry-run", action="store_true", default=None,
         help="Enable dry-run mode for buy/redeem",
     )
     parser.add_argument(

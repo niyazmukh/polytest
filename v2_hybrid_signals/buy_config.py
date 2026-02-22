@@ -11,6 +11,54 @@ from .env import DEFAULT_ENV_FILE, load_env_file
 _Argv = Optional[list[str]]
 
 
+def _env_str(name: str, default: str) -> str:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    text = str(raw).strip()
+    return text if text else default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return float(default)
+    text = str(raw).strip()
+    if not text:
+        return float(default)
+    try:
+        return float(text)
+    except ValueError:
+        return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return int(default)
+    text = str(raw).strip()
+    if not text:
+        return int(default)
+    try:
+        return int(text)
+    except ValueError:
+        return int(default)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    text = str(raw).strip().lower()
+    if not text:
+        return bool(default)
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
 @dataclass(slots=True)
 class BuyConfig:
     env_file: str
@@ -35,11 +83,14 @@ class BuyConfig:
     max_price: float
     min_price: float
     max_slippage_abs: float
+    skip_book_enabled: bool
 
     max_usdc_per_market: float
     max_usdc_per_token: float
     allow_sell_signals: bool
     actionable_require_live_market_match: bool
+    require_market_open: bool
+    market_close_guard_seconds: float
     actionable_sources: tuple[str, ...]
 
     quote_wait_timeout_seconds: float
@@ -49,6 +100,10 @@ class BuyConfig:
     use_ws_market_feed: bool
     ws_heartbeat_seconds: float
     ws_reconnect_seconds: float
+    feed_max_tracked_tokens: int
+    feed_track_ttl_seconds: float
+    feed_poll_batch_size: int
+    feed_ws_subscribe_batch_size: int
 
     input_path: Optional[str]
 
@@ -66,7 +121,10 @@ def parse_args(argv: _Argv = None) -> BuyConfig:
     parser.add_argument("--env-file", default=env_file, help="path to env file (default: .env.v2.local)")
     parser.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--clob-host", default=os.environ.get("CLOB_HOST", "https://clob.polymarket.com"))
-    parser.add_argument("--ws-market-url", default="wss://ws-subscriptions-clob.polymarket.com/ws/market")
+    parser.add_argument(
+        "--ws-market-url",
+        default=_env_str("WS_MARKET_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market"),
+    )
     parser.add_argument(
         "--private-key",
         default=os.environ.get("PRIVATE_KEY", ""),
@@ -95,74 +153,155 @@ def parse_args(argv: _Argv = None) -> BuyConfig:
     parser.add_argument("--chain-id", type=int, default=int(os.environ.get("CHAIN_ID", "137")))
     parser.add_argument("--signature-type", type=int, default=int(os.environ.get("SIGNATURE_TYPE", "1")))
 
-    parser.add_argument("--order-type", choices=["FAK", "FOK"], default="FAK")
+    parser.add_argument("--order-type", choices=["FAK", "FOK"], default=_env_str("BUY_ORDER_TYPE", "FAK"))
     parser.add_argument(
         "--order-usdc",
         type=float,
-        default=2.0,
+        default=_env_float("BUY_ORDER_USDC", 2.0),
         help="fallback USDC notional when source notional is unavailable",
     )
     parser.add_argument(
         "--copy-scale",
         type=float,
-        default=0.1,
+        default=_env_float("BUY_COPY_SCALE", 0.1),
         help="copy fraction of source usdc_size (0.1 means 10%%); <=0 disables scaling and uses --order-usdc",
     )
     parser.add_argument(
         "--max-single-order-usdc",
         type=float,
-        default=2.0,
+        default=_env_float("BUY_MAX_SINGLE_ORDER_USDC", 2.0),
         help="hard cap per copied trade (0 disables cap)",
     )
-    parser.add_argument("--min-order-usdc", type=float, default=1.0)
+    parser.add_argument("--min-order-usdc", type=float, default=_env_float("BUY_MIN_ORDER_USDC", 1.0))
     parser.add_argument(
         "--min-source-signal-price",
         type=float,
-        default=0.57,
+        default=_env_float("BUY_MIN_SOURCE_SIGNAL_PRICE", 0.57),
         help="require actionable signal price >= this threshold (supports 0..1 or 0..100 style input)",
     )
     parser.add_argument(
         "--max-signal-age-seconds",
         type=float,
-        default=7.0,
+        default=_env_float("BUY_MAX_SIGNAL_AGE_SECONDS", 7.0),
         help="hard guard: only copy signals younger than this age; <=0 disables",
     )
-    parser.add_argument("--max-price", type=float, default=0.97)
-    parser.add_argument("--min-price", type=float, default=0.57)
-    parser.add_argument("--max-slippage-abs", type=float, default=0.02, help="worst_price = best_ask + this")
+    parser.add_argument("--max-price", type=float, default=_env_float("BUY_MAX_PRICE", 0.97))
+    parser.add_argument("--min-price", type=float, default=_env_float("BUY_MIN_PRICE", 0.57))
+    parser.add_argument(
+        "--max-slippage-abs",
+        type=float,
+        default=_env_float("BUY_MAX_SLIPPAGE_ABS", 0.10),
+        help="worst_price = source_price + this",
+    )
+    parser.add_argument(
+        "--skip-book-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("BUY_SKIP_BOOK_ENABLED", True),
+        help="use source-price-driven submit path; disable to use quote/book resolution path",
+    )
 
-    parser.add_argument("--max-usdc-per-market", type=float, default=10.0, help="0 disables")
-    parser.add_argument("--max-usdc-per-token", type=float, default=6.0, help="0 disables")
-    parser.add_argument("--allow-sell-signals", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--max-usdc-per-market",
+        type=float,
+        default=_env_float("BUY_MAX_USDC_PER_MARKET", 10.0),
+        help="0 disables",
+    )
+    parser.add_argument(
+        "--max-usdc-per-token",
+        type=float,
+        default=_env_float("BUY_MAX_USDC_PER_TOKEN", 6.0),
+        help="0 disables",
+    )
+    parser.add_argument(
+        "--allow-sell-signals",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("BUY_ALLOW_SELL_SIGNALS", False),
+    )
     parser.add_argument(
         "--actionable-require-live-market-match",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=_env_bool("BUY_REQUIRE_LIVE_MARKET_MATCH", True),
         help="only trade when signal slug/condition matches detected live market",
     )
     parser.add_argument(
+        "--require-market-open",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("BUY_REQUIRE_MARKET_OPEN", True),
+        help="skip if matched live market reports inactive/closed or has reached end_ts",
+    )
+    parser.add_argument(
+        "--market-close-guard-seconds",
+        type=float,
+        default=_env_float("BUY_MARKET_CLOSE_GUARD_SECONDS", 0.0),
+        help="treat market as closed this many seconds before end_ts",
+    )
+    parser.add_argument(
         "--actionable-sources",
-        default="orderbook_subgraph,activity",
+        default=_env_str("BUY_ACTIONABLE_SOURCES", "orderbook_subgraph,activity"),
         help="comma-separated allowed ACTIONABLE_SIGNAL source values",
     )
 
-    parser.add_argument("--quote-wait-timeout-seconds", type=float, default=0.12)
-    parser.add_argument("--quote-stale-after-seconds", type=float, default=0.8)
+    parser.add_argument(
+        "--quote-wait-timeout-seconds",
+        type=float,
+        default=_env_float("BUY_QUOTE_WAIT_TIMEOUT_SECONDS", 0.12),
+    )
+    parser.add_argument(
+        "--quote-stale-after-seconds",
+        type=float,
+        default=_env_float("BUY_QUOTE_STALE_AFTER_SECONDS", 0.8),
+    )
     parser.add_argument(
         "--quote-fallback-stale-seconds",
         type=float,
-        default=2.5,
+        default=_env_float("BUY_QUOTE_FALLBACK_STALE_SECONDS", 2.5),
         help="if fresh quote is unavailable, allow this much staleness before /book fallback",
     )
     parser.add_argument(
         "--book-poll-interval-seconds",
         type=float,
-        default=0.007,
+        default=_env_float("BUY_BOOK_POLL_INTERVAL_SECONDS", 0.007),
         help="fallback /books poll cadence (0.007s ~= 95 pct of docs 1500/10s)",
     )
-    parser.add_argument("--use-ws-market-feed", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--ws-heartbeat-seconds", type=float, default=10.0)
-    parser.add_argument("--ws-reconnect-seconds", type=float, default=0.4)
+    parser.add_argument(
+        "--use-ws-market-feed",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("BUY_USE_WS_MARKET_FEED", True),
+    )
+    parser.add_argument(
+        "--ws-heartbeat-seconds",
+        type=float,
+        default=_env_float("BUY_WS_HEARTBEAT_SECONDS", 10.0),
+    )
+    parser.add_argument(
+        "--ws-reconnect-seconds",
+        type=float,
+        default=_env_float("BUY_WS_RECONNECT_SECONDS", 0.4),
+    )
+    parser.add_argument(
+        "--feed-max-tracked-tokens",
+        type=int,
+        default=_env_int("BUY_FEED_MAX_TRACKED_TOKENS", 256),
+        help="max tracked tokens kept hot in quote feed (<=0 disables cap)",
+    )
+    parser.add_argument(
+        "--feed-track-ttl-seconds",
+        type=float,
+        default=_env_float("BUY_FEED_TRACK_TTL_SECONDS", 1800.0),
+        help="drop tokens from quote feed if not touched for this duration (<=0 disables ttl prune)",
+    )
+    parser.add_argument(
+        "--feed-poll-batch-size",
+        type=int,
+        default=_env_int("BUY_FEED_POLL_BATCH_SIZE", 120),
+        help="max tokens per get_order_books poll call",
+    )
+    parser.add_argument(
+        "--feed-ws-subscribe-batch-size",
+        type=int,
+        default=_env_int("BUY_FEED_WS_SUBSCRIBE_BATCH_SIZE", 256),
+        help="max assets_ids included in ws subscribe payload",
+    )
 
     parser.add_argument(
         "--input-path",
@@ -213,10 +352,13 @@ def parse_args(argv: _Argv = None) -> BuyConfig:
         max_price=min(0.9999, max(0.001, float(args.max_price))),
         min_price=min(0.9999, max(0.0, float(args.min_price))),
         max_slippage_abs=max(0.0, float(args.max_slippage_abs)),
+        skip_book_enabled=bool(args.skip_book_enabled),
         max_usdc_per_market=max(0.0, float(args.max_usdc_per_market)),
         max_usdc_per_token=max(0.0, float(args.max_usdc_per_token)),
         allow_sell_signals=bool(args.allow_sell_signals),
         actionable_require_live_market_match=bool(args.actionable_require_live_market_match),
+        require_market_open=bool(args.require_market_open),
+        market_close_guard_seconds=max(0.0, float(args.market_close_guard_seconds)),
         actionable_sources=sources,
         quote_wait_timeout_seconds=max(0.01, float(args.quote_wait_timeout_seconds)),
         quote_stale_after_seconds=max(0.05, float(args.quote_stale_after_seconds)),
@@ -225,5 +367,9 @@ def parse_args(argv: _Argv = None) -> BuyConfig:
         use_ws_market_feed=bool(args.use_ws_market_feed),
         ws_heartbeat_seconds=max(1.0, float(args.ws_heartbeat_seconds)),
         ws_reconnect_seconds=max(0.05, float(args.ws_reconnect_seconds)),
+        feed_max_tracked_tokens=max(0, int(args.feed_max_tracked_tokens)),
+        feed_track_ttl_seconds=max(0.0, float(args.feed_track_ttl_seconds)),
+        feed_poll_batch_size=max(1, int(args.feed_poll_batch_size)),
+        feed_ws_subscribe_batch_size=max(1, int(args.feed_ws_subscribe_batch_size)),
         input_path=None if args.input_path is None else str(args.input_path),
     )

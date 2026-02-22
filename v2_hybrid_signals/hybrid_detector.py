@@ -11,7 +11,12 @@ from .config import HybridConfig
 from .market_cache import GammaMarketCache
 from .models import SourceSignal
 from .rate_gate import RateGate
-from .sources import DataApiActivitySource, OrderbookSubgraphSource
+from .sources import (
+    DataApiActivityBatchSource,
+    DataApiActivitySource,
+    OrderbookSubgraphBatchSource,
+    OrderbookSubgraphSource,
+)
 from .utils import safe_stdout_flush
 
 
@@ -41,28 +46,52 @@ class HybridDetector:
         self._subgraph_rate = RateGate(cfg.subgraph_target_rps)
 
         self.market_cache = GammaMarketCache(cfg=cfg, stop_event=self.stop_event)
-        self.activities = [
-            DataApiActivitySource(
-                cfg=cfg,
-                tracked_user=user,
-                out_queue=self.signal_queue,
-                stop_event=self.stop_event,
-                market_cache=self.market_cache,
-                rate=self._activity_rate,
-            )
-            for user in cfg.users
-        ]
-        self.subgraphs = [
-            OrderbookSubgraphSource(
-                cfg=cfg,
-                tracked_user=user,
-                out_queue=self.signal_queue,
-                stop_event=self.stop_event,
-                market_cache=self.market_cache,
-                rate=self._subgraph_rate,
-            )
-            for user in cfg.users
-        ]
+        if bool(cfg.activity_batch_enabled) and len(cfg.users) > 1:
+            self.activities = [
+                DataApiActivityBatchSource(
+                    cfg=cfg,
+                    tracked_users=cfg.users,
+                    out_queue=self.signal_queue,
+                    stop_event=self.stop_event,
+                    market_cache=self.market_cache,
+                    rate=self._activity_rate,
+                )
+            ]
+        else:
+            self.activities = [
+                DataApiActivitySource(
+                    cfg=cfg,
+                    tracked_user=user,
+                    out_queue=self.signal_queue,
+                    stop_event=self.stop_event,
+                    market_cache=self.market_cache,
+                    rate=self._activity_rate,
+                )
+                for user in cfg.users
+            ]
+        if bool(cfg.subgraph_batch_enabled) and len(cfg.users) > 1:
+            self.subgraphs = [
+                OrderbookSubgraphBatchSource(
+                    cfg=cfg,
+                    tracked_users=cfg.users,
+                    out_queue=self.signal_queue,
+                    stop_event=self.stop_event,
+                    market_cache=self.market_cache,
+                    rate=self._subgraph_rate,
+                )
+            ]
+        else:
+            self.subgraphs = [
+                OrderbookSubgraphSource(
+                    cfg=cfg,
+                    tracked_user=user,
+                    out_queue=self.signal_queue,
+                    stop_event=self.stop_event,
+                    market_cache=self.market_cache,
+                    rate=self._subgraph_rate,
+                )
+                for user in cfg.users
+            ]
 
         self.started_at = 0.0
         self.deadline_at: float | None = None
@@ -146,7 +175,7 @@ class HybridDetector:
 
         out: Dict[str, Any] = {
             "source": rows[0].get("source"),
-            "tracked_users": [str(r.get("tracked_user")) for r in rows if r.get("tracked_user")],
+            "tracked_users": [],
             "target_rps": 0.0,
             "polls": 0,
             "errors": 0,
@@ -155,19 +184,49 @@ class HybridDetector:
             "last_poll_rtt_seconds": None,
         }
 
+        target_rps_max = 0.0
         rate_target = 0.0
         rate_effective = 0.0
         rate_factor_sum = 0.0
         rate_count = 0
-        dedupe_total = 0
+        dedupe_keys_total = 0
+        dedupe_event_ids_total = 0
         last_head_lag: float | None = None
+        per_user: Dict[str, Dict[str, Any]] = {}
+        rate_seen: set[str] = set()
 
-        for row in rows:
-            out["target_rps"] += _as_float(row.get("target_rps"))
+        for idx, row in enumerate(rows):
+            tracked_user = row.get("tracked_user")
+            if tracked_user:
+                out["tracked_users"].append(str(tracked_user))
+            tracked_users = row.get("tracked_users")
+            if isinstance(tracked_users, list):
+                for user in tracked_users:
+                    if user:
+                        out["tracked_users"].append(str(user))
+
+            row_target_rps = _as_float(row.get("target_rps"))
+            if row_target_rps > target_rps_max:
+                target_rps_max = row_target_rps
             out["polls"] += int(_as_float(row.get("polls")))
             out["errors"] += int(_as_float(row.get("errors")))
             out["signals"] += int(_as_float(row.get("signals")))
             out["dropped"] += int(_as_float(row.get("dropped")))
+
+            if row.get("batch_mode"):
+                out["batch_mode"] = True
+            if row.get("priority_mode"):
+                out["priority_mode"] = row.get("priority_mode")
+            if row.get("activity_priority_active_window_seconds") is not None:
+                out["activity_priority_active_window_seconds"] = row.get("activity_priority_active_window_seconds")
+            if row.get("activity_priority_max_probe_seconds") is not None:
+                out["activity_priority_max_probe_seconds"] = row.get("activity_priority_max_probe_seconds")
+
+            row_per_user = row.get("per_user")
+            if isinstance(row_per_user, dict):
+                for user, value in row_per_user.items():
+                    if isinstance(user, str) and isinstance(value, dict):
+                        per_user[user] = value
 
             poll_rtt = row.get("last_poll_rtt_seconds")
             if poll_rtt is not None:
@@ -176,8 +235,8 @@ class HybridDetector:
                 if prev is None or poll_rtt_f > _as_float(prev):
                     out["last_poll_rtt_seconds"] = round(poll_rtt_f, 4)
 
-            dedupe_total += int(_as_float(row.get("dedupe_keys")))
-            dedupe_total += int(_as_float(row.get("dedupe_event_ids")))
+            dedupe_keys_total += int(_as_float(row.get("dedupe_keys")))
+            dedupe_event_ids_total += int(_as_float(row.get("dedupe_event_ids")))
 
             lag = row.get("last_head_lag_seconds")
             if lag is not None:
@@ -187,18 +246,28 @@ class HybridDetector:
 
             rate = row.get("rate")
             if isinstance(rate, dict):
+                rate_key = row.get("rate_instance_id")
+                if rate_key is None:
+                    rate_id = f"row:{idx}"
+                else:
+                    rate_id = str(rate_key)
+                if rate_id in rate_seen:
+                    continue
+                rate_seen.add(rate_id)
                 rate_target += _as_float(rate.get("target_rps"))
                 rate_effective += _as_float(rate.get("effective_rps"))
                 rate_factor_sum += _as_float(rate.get("throttle_factor"))
                 rate_count += 1
 
-        out["target_rps"] = round(_as_float(out["target_rps"]), 3)
-        out["dedupe_keys"] = dedupe_total
+        out["target_rps"] = round(target_rps_max, 3)
         if rows and rows[0].get("source") == "orderbook_subgraph":
-            out["dedupe_event_ids"] = dedupe_total
-            out.pop("dedupe_keys", None)
+            out["dedupe_event_ids"] = dedupe_event_ids_total
+        else:
+            out["dedupe_keys"] = dedupe_keys_total
         if last_head_lag is not None:
             out["last_head_lag_seconds"] = round(last_head_lag, 4)
+        if per_user:
+            out["per_user"] = per_user
         if rate_count > 0:
             out["rate"] = {
                 "target_rps": round(rate_target, 6),
@@ -207,6 +276,16 @@ class HybridDetector:
             }
         else:
             out["rate"] = {}
+
+        # Preserve stable order while removing duplicates.
+        seen_users: set[str] = set()
+        unique_users: list[str] = []
+        for user in out["tracked_users"]:
+            if user in seen_users:
+                continue
+            seen_users.add(user)
+            unique_users.append(user)
+        out["tracked_users"] = unique_users
 
         if len(out["tracked_users"]) == 1:
             out["tracked_user"] = out["tracked_users"][0]
@@ -320,10 +399,6 @@ class HybridDetector:
         ]
         for k in stale_keys:
             del self.match_state[k]
-        stale_tx = [
-            k for k in self.tx_keys
-            if "|" in k  # all valid keys contain '|'
-        ]
         # tx_keys don't carry timestamps; cap size instead.
         if len(self.tx_keys) > 200_000:
             self.tx_keys.clear()

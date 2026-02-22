@@ -11,6 +11,33 @@ from .env import DEFAULT_ENV_FILE, load_env_file
 _Argv = Optional[list[str]]
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return float(default)
+    text = str(raw).strip()
+    if not text:
+        return float(default)
+    try:
+        return float(text)
+    except ValueError:
+        return float(default)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    text = str(raw).strip().lower()
+    if not text:
+        return bool(default)
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
 @dataclass(slots=True)
 class HybridConfig:
     env_file: str
@@ -24,6 +51,9 @@ class HybridConfig:
 
     activity_limit_per_10s: float
     activity_edge_fraction: float
+    activity_batch_enabled: bool
+    activity_priority_active_window_seconds: float
+    activity_priority_max_probe_seconds: float
     activity_http_timeout_seconds: float
     activity_lookback_seconds: int
     activity_page_size: int
@@ -33,6 +63,7 @@ class HybridConfig:
     subgraph_edge_fraction: float
     subgraph_http_timeout_seconds: float
     subgraph_page_size: int
+    subgraph_batch_enabled: bool
 
     gamma_limit_per_10s: float
     gamma_events_limit_per_10s: float
@@ -115,21 +146,47 @@ def parse_args(argv: _Argv = None) -> HybridConfig:
     parser.add_argument("--emit-source-events", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--queue-maxsize", type=int, default=200000)
 
-    parser.add_argument("--activity-limit-per-10s", type=float, default=1000.0)
-    parser.add_argument("--activity-edge-fraction", type=float, default=0.98)
+    parser.add_argument("--activity-limit-per-10s", type=float, default=_env_float("ACTIVITY_LIMIT_PER_10S", 1000.0))
+    parser.add_argument("--activity-edge-fraction", type=float, default=_env_float("ACTIVITY_EDGE_FRACTION", 0.98))
+    parser.add_argument(
+        "--activity-batch-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("ACTIVITY_BATCH_ENABLED", True),
+        help="batch/schedule multi-wallet activity polling with active-wallet priority",
+    )
+    parser.add_argument(
+        "--activity-priority-active-window-seconds",
+        type=float,
+        default=_env_float("ACTIVITY_PRIORITY_ACTIVE_WINDOW_SECONDS", 3600.0),
+    )
+    parser.add_argument(
+        "--activity-priority-max-probe-seconds",
+        type=float,
+        default=_env_float("ACTIVITY_PRIORITY_MAX_PROBE_SECONDS", 1.0),
+    )
     parser.add_argument("--activity-http-timeout-seconds", type=float, default=4.0)
     parser.add_argument("--activity-lookback-seconds", type=int, default=30)
     parser.add_argument("--activity-page-size", type=int, default=500)
     parser.add_argument("--activity-max-pages", type=int, default=2)
 
-    parser.add_argument("--subgraph-limit-per-10s", type=float, default=200.0)
-    parser.add_argument("--subgraph-edge-fraction", type=float, default=0.95)
+    parser.add_argument("--subgraph-limit-per-10s", type=float, default=_env_float("SUBGRAPH_LIMIT_PER_10S", 200.0))
+    parser.add_argument("--subgraph-edge-fraction", type=float, default=_env_float("SUBGRAPH_EDGE_FRACTION", 0.95))
     parser.add_argument("--subgraph-http-timeout-seconds", type=float, default=4.0)
     parser.add_argument("--subgraph-page-size", type=int, default=500)
+    parser.add_argument(
+        "--subgraph-batch-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("SUBGRAPH_BATCH_ENABLED", True),
+        help="batch multi-wallet subgraph polling into one request loop",
+    )
 
-    parser.add_argument("--gamma-limit-per-10s", type=float, default=300.0)
-    parser.add_argument("--gamma-events-limit-per-10s", type=float, default=500.0)
-    parser.add_argument("--gamma-edge-fraction", type=float, default=0.95)
+    parser.add_argument("--gamma-limit-per-10s", type=float, default=_env_float("GAMMA_LIMIT_PER_10S", 300.0))
+    parser.add_argument(
+        "--gamma-events-limit-per-10s",
+        type=float,
+        default=_env_float("GAMMA_EVENTS_LIMIT_PER_10S", 500.0),
+    )
+    parser.add_argument("--gamma-edge-fraction", type=float, default=_env_float("GAMMA_EDGE_FRACTION", 0.95))
     parser.add_argument("--gamma-http-timeout-seconds", type=float, default=4.0)
     parser.add_argument("--gamma-refresh-interval-seconds", type=float, default=15.0)
     parser.add_argument("--gamma-warmup-pages", type=int, default=2)
@@ -199,6 +256,9 @@ def parse_args(argv: _Argv = None) -> HybridConfig:
         queue_maxsize=max(1000, int(args.queue_maxsize)),
         activity_limit_per_10s=max(1.0, float(args.activity_limit_per_10s)),
         activity_edge_fraction=min(1.0, max(0.01, float(args.activity_edge_fraction))),
+        activity_batch_enabled=bool(args.activity_batch_enabled),
+        activity_priority_active_window_seconds=max(60.0, float(args.activity_priority_active_window_seconds)),
+        activity_priority_max_probe_seconds=max(0.05, min(5.0, float(args.activity_priority_max_probe_seconds))),
         activity_http_timeout_seconds=max(0.25, float(args.activity_http_timeout_seconds)),
         activity_lookback_seconds=max(2, int(args.activity_lookback_seconds)),
         activity_page_size=max(10, min(1000, int(args.activity_page_size))),
@@ -207,6 +267,7 @@ def parse_args(argv: _Argv = None) -> HybridConfig:
         subgraph_edge_fraction=min(1.0, max(0.01, float(args.subgraph_edge_fraction))),
         subgraph_http_timeout_seconds=max(0.25, float(args.subgraph_http_timeout_seconds)),
         subgraph_page_size=max(10, min(1000, int(args.subgraph_page_size))),
+        subgraph_batch_enabled=bool(args.subgraph_batch_enabled),
         gamma_limit_per_10s=max(1.0, float(args.gamma_limit_per_10s)),
         gamma_events_limit_per_10s=max(1.0, float(args.gamma_events_limit_per_10s)),
         gamma_edge_fraction=min(1.0, max(0.01, float(args.gamma_edge_fraction))),
