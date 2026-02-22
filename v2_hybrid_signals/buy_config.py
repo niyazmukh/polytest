@@ -173,7 +173,7 @@ def parse_args(argv: _Argv = None) -> BuyConfig:
     parser.add_argument(
         "--fak-retry-delay-seconds",
         type=float,
-        default=env_float("BUY_FAK_RETRY_DELAY_SECONDS", 0.03),
+        default=env_float("BUY_FAK_RETRY_DELAY_SECONDS", 0.0),
         help="pause between no-match retry attempts",
     )
     parser.add_argument(

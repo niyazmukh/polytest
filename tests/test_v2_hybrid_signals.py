@@ -573,6 +573,108 @@ class TestBuyExecutorPricing(unittest.TestCase):
         self.assertEqual(int(decision.get("retryable_no_match_count", 0)), 3)
         self.assertEqual(fake_client.post_calls, 3)
 
+    @patch.dict(os.environ, {
+        "BUY_REQUIRE_LIVE_MARKET_MATCH": "0",
+        "BUY_SKIP_BOOK_ENABLED": "1",
+        "BUY_ORDER_TYPE": "FAK",
+        "BUY_FAK_RETRY_ENABLED": "1",
+        "BUY_FAK_RETRY_MAX_ATTEMPTS": "3",
+        "BUY_FAK_RETRY_DELAY_SECONDS": "0.05",
+        "BUY_FAK_RETRY_MAX_WINDOW_SECONDS": "1.0",
+    }, clear=False)
+    def test_queue_pressure_suppresses_retry_delay(self) -> None:
+        from v2_hybrid_signals.buy_config import parse_args
+        from v2_hybrid_signals.buy_executor import BuyExecutor
+
+        cfg = parse_args([])
+        feed = _StubPriceFeed()
+        executor = BuyExecutor(cfg=cfg, price_feed=feed)  # type: ignore[arg-type]
+        executor.readonly_client = _FakeReadonlyClient()
+        executor.cfg.dry_run = False
+        fake_client = _FakeTradeClient(
+            [
+                "no orders found to match with FAK order",
+                "there are no matching orders",
+            ]
+        )
+        executor.client = fake_client
+
+        now = time.time()
+        with patch("v2_hybrid_signals.buy_executor._MarketOrderArgs", _FakeMarketOrderArgs):
+            with patch("v2_hybrid_signals.buy_executor.time.sleep") as mock_sleep:
+                decision = executor.process_actionable(
+                    {
+                        "match_key": "m8",
+                        "source": "orderbook_subgraph",
+                        "_queue_depth": 4,
+                        "event_ts": now,
+                        "signal": {
+                            "side": "BUY",
+                            "token_id": "tok8",
+                            "price": 0.60,
+                            "usdc_size": 10.0,
+                            "condition_id": "cond8",
+                        },
+                    },
+                    live_markets=[],
+                )
+
+        self.assertEqual(decision.get("status"), "submitted")
+        self.assertEqual(decision.get("fak_retry_delay_suppressed_for_queue"), True)
+        self.assertAlmostEqual(float(decision.get("fak_retry_effective_delay_seconds", -1.0)), 0.0, places=6)
+        mock_sleep.assert_not_called()
+
+    @patch.dict(os.environ, {
+        "BUY_REQUIRE_LIVE_MARKET_MATCH": "0",
+        "BUY_SKIP_BOOK_ENABLED": "1",
+        "BUY_ORDER_TYPE": "FAK",
+        "BUY_FAK_RETRY_ENABLED": "1",
+        "BUY_FAK_RETRY_MAX_ATTEMPTS": "3",
+        "BUY_FAK_RETRY_DELAY_SECONDS": "0",
+        "BUY_FAK_RETRY_MAX_WINDOW_SECONDS": "0.0001",
+    }, clear=False)
+    def test_retry_window_boundary_prevents_extra_attempt(self) -> None:
+        from v2_hybrid_signals.buy_config import parse_args
+        from v2_hybrid_signals.buy_executor import BuyExecutor
+
+        cfg = parse_args([])
+        feed = _StubPriceFeed()
+        executor = BuyExecutor(cfg=cfg, price_feed=feed)  # type: ignore[arg-type]
+        executor.readonly_client = _FakeReadonlyClient()
+        executor.cfg.dry_run = False
+        fake_client = _FakeTradeClient(
+            [
+                "no orders found to match with FAK order",
+                "no orders found to match with FAK order",
+                "no orders found to match with FAK order",
+            ]
+        )
+        executor.client = fake_client
+
+        perf_times = [0.0, 0.0, 0.0002, 0.0002, 0.0002, 0.0002, 0.0002, 0.0002]
+        now = time.time()
+        with patch("v2_hybrid_signals.buy_executor._MarketOrderArgs", _FakeMarketOrderArgs):
+            with patch("v2_hybrid_signals.buy_executor.time.perf_counter", side_effect=perf_times):
+                decision = executor.process_actionable(
+                    {
+                        "match_key": "m9",
+                        "source": "orderbook_subgraph",
+                        "event_ts": now,
+                        "signal": {
+                            "side": "BUY",
+                            "token_id": "tok9",
+                            "price": 0.60,
+                            "usdc_size": 10.0,
+                            "condition_id": "cond9",
+                        },
+                    },
+                    live_markets=[],
+                )
+
+        self.assertEqual(decision.get("status"), "no_fill")
+        self.assertEqual(int(decision.get("submit_attempts", 0)), 1)
+        self.assertEqual(fake_client.post_calls, 1)
+
 
 # ---------------------------------------------------------------------------
 # Test: HybridDetector fires signal_callback on ACTIONABLE_SIGNAL

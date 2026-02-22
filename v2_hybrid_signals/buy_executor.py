@@ -280,6 +280,14 @@ class BuyExecutor:
     ) -> Dict[str, Any]:
         decision_started = time.perf_counter()
         queue_lag_seconds = _as_float(payload.get("_queue_lag_seconds"))
+        queue_depth_raw = payload.get("_queue_depth")
+        queue_depth = 0
+        try:
+            queue_depth = int(queue_depth_raw) if queue_depth_raw is not None else 0
+        except Exception:
+            queue_depth = 0
+        if queue_depth < 0:
+            queue_depth = 0
         event_ts = _as_float(payload.get("event_ts"))
 
         def _skip_with_latency(reason: str, **extra: Any) -> Dict[str, Any]:
@@ -472,6 +480,10 @@ class BuyExecutor:
             max_attempts = self.cfg.fak_retry_max_attempts if retry_enabled else 1
             retry_delay_seconds = max(0.0, float(self.cfg.fak_retry_delay_seconds))
             retry_window_seconds = max(0.0, float(self.cfg.fak_retry_max_window_seconds))
+            retry_delay_suppressed_for_queue = False
+            if queue_depth > 0 and retry_delay_seconds > 0:
+                retry_delay_seconds = 0.0
+                retry_delay_suppressed_for_queue = True
 
             submit_attempts = 0
             retryable_no_match_count = 0
@@ -480,6 +492,10 @@ class BuyExecutor:
             final_exc: Optional[Exception] = None
 
             while submit_attempts < max_attempts:
+                if submit_attempts > 0 and retry_window_seconds > 0:
+                    elapsed_before_attempt = time.perf_counter() - submit_started
+                    if elapsed_before_attempt >= retry_window_seconds:
+                        break
                 submit_attempts += 1
                 attempt_started = time.perf_counter()
                 try:
@@ -499,6 +515,9 @@ class BuyExecutor:
                     decision["submit_attempts"] = submit_attempts
                     if retryable_no_match_count > 0:
                         decision["retryable_no_match_count"] = retryable_no_match_count
+                    decision["fak_retry_effective_delay_seconds"] = round(retry_delay_seconds, 6)
+                    if retry_delay_suppressed_for_queue:
+                        decision["fak_retry_delay_suppressed_for_queue"] = True
                     decision["submit_attempt_latencies_ms"] = attempt_latencies_ms
                     decision["submit_latency_ms"] = round((time.perf_counter() - submit_started) * 1000.0, 3)
                     decision["decision_latency_ms"] = round((time.perf_counter() - decision_started) * 1000.0, 3)
@@ -550,6 +569,9 @@ class BuyExecutor:
                 decision["retryable_no_match_count"] = retryable_no_match_count
                 if retryable_no_match_count >= submit_attempts:
                     decision["error_kind"] = "fak_no_match_exhausted"
+            decision["fak_retry_effective_delay_seconds"] = round(retry_delay_seconds, 6)
+            if retry_delay_suppressed_for_queue:
+                decision["fak_retry_delay_suppressed_for_queue"] = True
             if attempt_errors:
                 decision["last_submit_error"] = attempt_errors[-1]
             decision["submit_latency_ms"] = round((time.perf_counter() - submit_started) * 1000.0, 3)

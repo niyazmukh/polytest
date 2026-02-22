@@ -215,6 +215,7 @@ class ServiceRunner:
                     enqueued_at_unix = None
                 if enqueued_at_unix is not None and enqueued_at_unix > 0:
                     payload["_queue_lag_seconds"] = max(0.0, time.time() - enqueued_at_unix)
+                payload["_queue_depth"] = self._actionable_queue.qsize()
 
                 with self._live_markets_lock:
                     live_markets = list(self.live_markets)
