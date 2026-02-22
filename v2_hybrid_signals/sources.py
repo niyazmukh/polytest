@@ -42,6 +42,25 @@ def _as_unix(raw: Any) -> Optional[int]:
     return int(value)
 
 
+def _prune_dedupe_entries(
+    seen_index: Dict[str, float],
+    seen_order: Deque[tuple[str, float]],
+    *,
+    now: float,
+    ttl_seconds: float,
+    max_keys: int,
+) -> None:
+    cutoff = now - ttl_seconds
+    while seen_order and seen_order[0][1] < cutoff:
+        old_key, _ = seen_order.popleft()
+        seen_index.pop(old_key, None)
+    if max_keys > 0:
+        # Keep capacity bounded before inserting a new key.
+        while len(seen_order) >= max_keys:
+            old_key, _ = seen_order.popleft()
+            seen_index.pop(old_key, None)
+
+
 def _decode_activity_row(
     *,
     user: str,
@@ -144,16 +163,16 @@ class DataApiActivitySource(threading.Thread):
         self.idle_backoff_seconds = 0.0
 
     def _remember(self, row_key: str) -> bool:
+        now = time.monotonic()
+        _prune_dedupe_entries(
+            self.seen_row_keys,
+            self.seen_order,
+            now=now,
+            ttl_seconds=self._dedupe_ttl,
+            max_keys=self.max_seen_keys,
+        )
         if row_key in self.seen_row_keys:
             return False
-        now = time.monotonic()
-        cutoff = now - self._dedupe_ttl
-        while self.seen_order and self.seen_order[0][1] < cutoff:
-            old_key, _ = self.seen_order.popleft()
-            self.seen_row_keys.pop(old_key, None)
-        while len(self.seen_order) > self.max_seen_keys:
-            old_key, _ = self.seen_order.popleft()
-            self.seen_row_keys.pop(old_key, None)
         self.seen_row_keys[row_key] = now
         self.seen_order.append((row_key, now))
         return True
@@ -421,16 +440,16 @@ class DataApiActivityBatchSource(threading.Thread):
 
     def _remember(self, user: str, row_key: str) -> bool:
         dedupe_key = f"{user}|{row_key}"
+        now = time.monotonic()
+        _prune_dedupe_entries(
+            self.seen_row_keys,
+            self.seen_order,
+            now=now,
+            ttl_seconds=self._dedupe_ttl,
+            max_keys=self.max_seen_keys,
+        )
         if dedupe_key in self.seen_row_keys:
             return False
-        now = time.monotonic()
-        cutoff = now - self._dedupe_ttl
-        while self.seen_order and self.seen_order[0][1] < cutoff:
-            old_key, _ = self.seen_order.popleft()
-            self.seen_row_keys.pop(old_key, None)
-        while len(self.seen_order) > self.max_seen_keys:
-            old_key, _ = self.seen_order.popleft()
-            self.seen_row_keys.pop(old_key, None)
         self.seen_row_keys[dedupe_key] = now
         self.seen_order.append((dedupe_key, now))
         return True
@@ -876,16 +895,16 @@ query OrderFilledEvents($user: String!, $start: BigInt!, $first: Int!) {
         self._working_path: Optional[str] = None
 
     def _remember(self, event_id: str) -> bool:
+        now = time.monotonic()
+        _prune_dedupe_entries(
+            self.seen_event_ids,
+            self.seen_order,
+            now=now,
+            ttl_seconds=self._dedupe_ttl,
+            max_keys=self.max_seen_ids,
+        )
         if event_id in self.seen_event_ids:
             return False
-        now = time.monotonic()
-        cutoff = now - self._dedupe_ttl
-        while self.seen_order and self.seen_order[0][1] < cutoff:
-            old_key, _ = self.seen_order.popleft()
-            self.seen_event_ids.pop(old_key, None)
-        while len(self.seen_order) > self.max_seen_ids:
-            old_key, _ = self.seen_order.popleft()
-            self.seen_event_ids.pop(old_key, None)
         self.seen_event_ids[event_id] = now
         self.seen_order.append((event_id, now))
         return True
@@ -1228,16 +1247,16 @@ class OrderbookSubgraphBatchSource(threading.Thread):
 
     def _remember(self, user: str, event_id: str) -> bool:
         dedupe_key = f"{user}|{event_id}"
+        now = time.monotonic()
+        _prune_dedupe_entries(
+            self.seen_event_ids,
+            self.seen_order,
+            now=now,
+            ttl_seconds=self._dedupe_ttl,
+            max_keys=self.max_seen_ids,
+        )
         if dedupe_key in self.seen_event_ids:
             return False
-        now = time.monotonic()
-        cutoff = now - self._dedupe_ttl
-        while self.seen_order and self.seen_order[0][1] < cutoff:
-            old_key, _ = self.seen_order.popleft()
-            self.seen_event_ids.pop(old_key, None)
-        while len(self.seen_order) > self.max_seen_ids:
-            old_key, _ = self.seen_order.popleft()
-            self.seen_event_ids.pop(old_key, None)
         self.seen_event_ids[dedupe_key] = now
         self.seen_order.append((dedupe_key, now))
         return True

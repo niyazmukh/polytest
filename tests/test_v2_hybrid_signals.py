@@ -12,6 +12,7 @@ import os
 import threading
 import time
 import unittest
+from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -688,6 +689,123 @@ class TestSharedRateGates(unittest.TestCase):
         snap = detector.subgraphs[0].snapshot()
         self.assertTrue(bool(snap.get("batch_mode")))
         self.assertEqual(len(list(snap.get("tracked_users") or [])), 3)
+
+
+# ---------------------------------------------------------------------------
+# Test: dedupe TTL pruning occurs before membership check
+# ---------------------------------------------------------------------------
+
+class _StubMarketCache:
+    def hint_from_activity(self, token_id: str, outcome: object, slug: object, condition_id: object) -> None:
+        _ = token_id
+        _ = outcome
+        _ = slug
+        _ = condition_id
+
+    def lookup_token(self, token_id: str, *, queue_on_miss: bool = False, fetch_on_miss: bool = False) -> None:
+        _ = token_id
+        _ = queue_on_miss
+        _ = fetch_on_miss
+        return None
+
+
+class TestDedupeTtlPruneOrder(unittest.TestCase):
+
+    @patch.dict(os.environ, {
+        "TRACKED_WALLET": "0xtest123",
+    }, clear=False)
+    def test_activity_single_reaccepts_expired_key(self) -> None:
+        from v2_hybrid_signals.config import parse_args
+        from v2_hybrid_signals.sources import DataApiActivitySource
+
+        cfg = parse_args([])
+        source = DataApiActivitySource(
+            cfg=cfg,
+            tracked_user=cfg.user,
+            out_queue=Queue(),
+            stop_event=threading.Event(),
+            market_cache=_StubMarketCache(),  # type: ignore[arg-type]
+        )
+        source._dedupe_ttl = 1.0
+        source.max_seen_keys = 100
+        try:
+            with patch("v2_hybrid_signals.sources.time.monotonic", side_effect=[0.0, 2.0]):
+                self.assertTrue(source._remember("row-1"))
+                self.assertTrue(source._remember("row-1"))
+        finally:
+            source.close()
+
+    @patch.dict(os.environ, {
+        "TRACKED_WALLET": "0xtest123",
+    }, clear=False)
+    def test_activity_batch_reaccepts_expired_key(self) -> None:
+        from v2_hybrid_signals.config import parse_args
+        from v2_hybrid_signals.sources import DataApiActivityBatchSource
+
+        cfg = parse_args([])
+        source = DataApiActivityBatchSource(
+            cfg=cfg,
+            tracked_users=(cfg.user,),
+            out_queue=Queue(),
+            stop_event=threading.Event(),
+            market_cache=_StubMarketCache(),  # type: ignore[arg-type]
+        )
+        source._dedupe_ttl = 1.0
+        source.max_seen_keys = 100
+        try:
+            with patch("v2_hybrid_signals.sources.time.monotonic", side_effect=[0.0, 2.0]):
+                self.assertTrue(source._remember(cfg.user, "row-1"))
+                self.assertTrue(source._remember(cfg.user, "row-1"))
+        finally:
+            source.close()
+
+    @patch.dict(os.environ, {
+        "TRACKED_WALLET": "0xtest123",
+    }, clear=False)
+    def test_subgraph_single_reaccepts_expired_key(self) -> None:
+        from v2_hybrid_signals.config import parse_args
+        from v2_hybrid_signals.sources import OrderbookSubgraphSource
+
+        cfg = parse_args([])
+        source = OrderbookSubgraphSource(
+            cfg=cfg,
+            tracked_user=cfg.user,
+            out_queue=Queue(),
+            stop_event=threading.Event(),
+            market_cache=_StubMarketCache(),  # type: ignore[arg-type]
+        )
+        source._dedupe_ttl = 1.0
+        source.max_seen_ids = 100
+        try:
+            with patch("v2_hybrid_signals.sources.time.monotonic", side_effect=[0.0, 2.0]):
+                self.assertTrue(source._remember("event-1"))
+                self.assertTrue(source._remember("event-1"))
+        finally:
+            source.close()
+
+    @patch.dict(os.environ, {
+        "TRACKED_WALLET": "0xtest123",
+    }, clear=False)
+    def test_subgraph_batch_reaccepts_expired_key(self) -> None:
+        from v2_hybrid_signals.config import parse_args
+        from v2_hybrid_signals.sources import OrderbookSubgraphBatchSource
+
+        cfg = parse_args([])
+        source = OrderbookSubgraphBatchSource(
+            cfg=cfg,
+            tracked_users=(cfg.user,),
+            out_queue=Queue(),
+            stop_event=threading.Event(),
+            market_cache=_StubMarketCache(),  # type: ignore[arg-type]
+        )
+        source._dedupe_ttl = 1.0
+        source.max_seen_ids = 100
+        try:
+            with patch("v2_hybrid_signals.sources.time.monotonic", side_effect=[0.0, 2.0]):
+                self.assertTrue(source._remember(cfg.user, "event-1"))
+                self.assertTrue(source._remember(cfg.user, "event-1"))
+        finally:
+            source.close()
 
 
 # ---------------------------------------------------------------------------
