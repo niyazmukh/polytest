@@ -60,6 +60,9 @@ class GammaMarketCache(threading.Thread):
             tf: re.compile(rf"^{re.escape(cfg.live_market_symbol)}-updown-{int(tf)}m-[0-9]+$")
             for tf in cfg.live_market_timeframes_minutes
         }
+        # Some 60m Bitcoin markets use human-readable slugs like:
+        # "bitcoin-up-or-down-february-22-2pm-et"
+        self._live_hourly_bitcoin_slug_re = re.compile(r"^bitcoin-up-or-down-[a-z0-9-]+$")
         self._live_market: Optional[Dict[str, Any]] = None
         self._live_markets: Dict[int, Dict[str, Any]] = {}
 
@@ -267,7 +270,12 @@ class GammaMarketCache(threading.Thread):
     def _market_is_live_candidate(self, row: Dict[str, Any], now_ts: float, timeframe_minutes: int) -> bool:
         slug = str(row.get("slug") or "").strip().lower()
         slug_re = self._live_slug_re_by_tf.get(int(timeframe_minutes))
-        if not slug or slug_re is None or not slug_re.match(slug):
+        slug_match = bool(slug and slug_re is not None and slug_re.match(slug))
+        # Optional fallback for 60m Bitcoin markets that don't follow
+        # "<symbol>-updown-60m-<bucket>" slug format.
+        if not slug_match and int(timeframe_minutes) == 60:
+            slug_match = bool(self._live_hourly_bitcoin_slug_re.match(slug))
+        if not slug_match:
             return False
         if not _as_bool(row.get("active")):
             return False

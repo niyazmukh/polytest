@@ -47,6 +47,8 @@ class BuyConfig:
     fak_retry_max_attempts: int
     fak_retry_delay_seconds: float
     fak_retry_max_window_seconds: float
+    fak_no_match_cooldown_seconds: float
+    worker_threads: int
 
     max_usdc_per_market: float
     max_usdc_per_token: float
@@ -181,6 +183,18 @@ def parse_args(argv: _Argv = None) -> BuyConfig:
         type=float,
         default=env_float("BUY_FAK_RETRY_MAX_WINDOW_SECONDS", 0.35),
         help="max elapsed wall-clock time across no-match retries",
+    )
+    parser.add_argument(
+        "--fak-no-match-cooldown-seconds",
+        type=float,
+        default=env_float("BUY_FAK_NO_MATCH_COOLDOWN_SECONDS", 0.0),
+        help="after FAK no-match, skip same-token buys for this duration",
+    )
+    parser.add_argument(
+        "--worker-threads",
+        type=int,
+        default=env_int("BUY_WORKER_THREADS", 1),
+        help="number of parallel buy workers consuming actionable queue",
     )
 
     parser.add_argument(
@@ -337,6 +351,8 @@ def parse_args(argv: _Argv = None) -> BuyConfig:
         fak_retry_max_attempts=max(1, int(args.fak_retry_max_attempts)),
         fak_retry_delay_seconds=max(0.0, float(args.fak_retry_delay_seconds)),
         fak_retry_max_window_seconds=max(0.0, float(args.fak_retry_max_window_seconds)),
+        fak_no_match_cooldown_seconds=max(0.0, float(args.fak_no_match_cooldown_seconds)),
+        worker_threads=max(1, int(args.worker_threads)),
         max_usdc_per_market=max(0.0, float(args.max_usdc_per_market)),
         max_usdc_per_token=max(0.0, float(args.max_usdc_per_token)),
         allow_sell_signals=bool(args.allow_sell_signals),

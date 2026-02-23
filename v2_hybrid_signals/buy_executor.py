@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import math
+import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -54,6 +55,8 @@ class BuyExecutor:
     def __init__(self, cfg: BuyConfig, price_feed: MarketPriceFeed | NullMarketPriceFeed) -> None:
         self.cfg = cfg
         self.price_feed = price_feed
+        self._state_lock = threading.Lock()
+        self._client_local = threading.local()
 
         if _ClobClient is not None:
             self.readonly_client = _ClobClient(cfg.clob_host, chain_id=cfg.chain_id)
@@ -61,6 +64,7 @@ class BuyExecutor:
             self.readonly_client = None
         self.client: Optional[Any] = None
         self.api_creds_source = "none"
+        self._client_api_creds: Optional[tuple[str, str, str]] = None
 
         self.accepted = 0
         self.submitted = 0
@@ -70,6 +74,9 @@ class BuyExecutor:
         self._seen_match_keys: set[str] = set()
         self._spent_market: Dict[str, float] = {}
         self._spent_token: Dict[str, float] = {}
+        self._reserved_market: Dict[str, float] = {}
+        self._reserved_token: Dict[str, float] = {}
+        self._fak_no_match_cooldown_until: Dict[str, float] = {}
 
         self.meta_prefetch_ok = 0
         self.meta_prefetch_errors = 0
@@ -79,26 +86,64 @@ class BuyExecutor:
         if not cfg.dry_run:
             if _ClobClient is None:
                 raise RuntimeError(f"py_clob_client_unavailable: {_CLOB_IMPORT_ERROR}")
-            self.client = _ClobClient(
-                cfg.clob_host,
-                chain_id=cfg.chain_id,
-                key=cfg.private_key,
-                signature_type=cfg.signature_type,
-                funder=cfg.funder,
-            )
+            if _ApiCreds is None:
+                raise RuntimeError(f"py_clob_client_types_unavailable: {_CLOB_IMPORT_ERROR}")
             if cfg.api_key and cfg.api_secret and cfg.api_passphrase:
-                if _ApiCreds is None:
-                    raise RuntimeError(f"py_clob_client_types_unavailable: {_CLOB_IMPORT_ERROR}")
-                self.client.set_api_creds(
-                    _ApiCreds(api_key=cfg.api_key, api_secret=cfg.api_secret, api_passphrase=cfg.api_passphrase)
+                self._client_api_creds = (
+                    str(cfg.api_key).strip(),
+                    str(cfg.api_secret).strip(),
+                    str(cfg.api_passphrase).strip(),
                 )
                 self.api_creds_source = "env"
             else:
-                creds = self.client.create_or_derive_api_creds()
+                bootstrap_client = _ClobClient(
+                    cfg.clob_host,
+                    chain_id=cfg.chain_id,
+                    key=cfg.private_key,
+                    signature_type=cfg.signature_type,
+                    funder=cfg.funder,
+                )
+                creds = bootstrap_client.create_or_derive_api_creds()
                 if creds is None:
                     raise RuntimeError("failed_to_create_or_derive_api_creds")
-                self.client.set_api_creds(creds)
+                api_key = str(getattr(creds, "api_key", "") or "").strip()
+                api_secret = str(getattr(creds, "api_secret", "") or "").strip()
+                api_passphrase = str(getattr(creds, "api_passphrase", "") or "").strip()
+                if not api_key or not api_secret or not api_passphrase:
+                    raise RuntimeError("derived_api_creds_incomplete")
+                self._client_api_creds = (api_key, api_secret, api_passphrase)
                 self.api_creds_source = "derived"
+
+    def _build_trading_client(self) -> Any:
+        if _ClobClient is None:
+            raise RuntimeError(f"py_clob_client_unavailable: {_CLOB_IMPORT_ERROR}")
+        if _ApiCreds is None:
+            raise RuntimeError(f"py_clob_client_types_unavailable: {_CLOB_IMPORT_ERROR}")
+        if self._client_api_creds is None:
+            raise RuntimeError("trading_client_credentials_unavailable")
+        api_key, api_secret, api_passphrase = self._client_api_creds
+        client = _ClobClient(
+            self.cfg.clob_host,
+            chain_id=self.cfg.chain_id,
+            key=self.cfg.private_key,
+            signature_type=self.cfg.signature_type,
+            funder=self.cfg.funder,
+        )
+        client.set_api_creds(
+            _ApiCreds(
+                api_key=api_key,
+                api_secret=api_secret,
+                api_passphrase=api_passphrase,
+            )
+        )
+        return client
+
+    def _get_thread_client(self) -> Any:
+        client = getattr(self._client_local, "client", None)
+        if client is None:
+            client = self._build_trading_client()
+            self._client_local.client = client
+        return client
 
     def prefetch_market_tokens(self, live_markets: Iterable[Dict[str, Any]]) -> None:
         if self.cfg.skip_book_enabled:
@@ -120,25 +165,30 @@ class BuyExecutor:
             return
         try:
             self.price_feed.track_token(token_id)
-            self.meta_prefetch_ok += 1
+            with self._state_lock:
+                self.meta_prefetch_ok += 1
         except Exception:
-            self.meta_prefetch_errors += 1
+            with self._state_lock:
+                self.meta_prefetch_errors += 1
 
     def _skip(self, reason: str, **extra: Any) -> Dict[str, Any]:
-        self.skipped += 1
+        with self._state_lock:
+            self.skipped += 1
         payload: Dict[str, Any] = {"decision": "skip", "reason": reason}
         payload.update(extra)
         return payload
 
     def _token_tick_size(self, token_id: str, quote: Optional[Dict[str, Any]]) -> float:
-        cached = self._tick_cache.get(token_id)
+        with self._state_lock:
+            cached = self._tick_cache.get(token_id)
         if cached is not None and cached > 0:
             return cached
 
         if quote is not None:
             q_tick = _as_float(quote.get("tick_size"))
             if q_tick is not None and q_tick > 0:
-                self._tick_cache[token_id] = q_tick
+                with self._state_lock:
+                    self._tick_cache[token_id] = q_tick
                 return q_tick
 
         try:
@@ -147,7 +197,8 @@ class BuyExecutor:
             tick_raw = self.readonly_client.get_tick_size(token_id)
             tick = _as_float(tick_raw)
             if tick is not None and tick > 0:
-                self._tick_cache[token_id] = tick
+                with self._state_lock:
+                    self._tick_cache[token_id] = tick
                 return tick
         except Exception:
             pass
@@ -304,10 +355,11 @@ class BuyExecutor:
         match_key = str(payload.get("match_key") or "").strip()
         if not match_key:
             return _skip_with_latency("missing_match_key")
-        if match_key in self._seen_match_keys:
-            return _skip_with_latency("duplicate_match_key", match_key=match_key)
-        self._seen_match_keys.add(match_key)
-        self.accepted += 1
+        with self._state_lock:
+            if match_key in self._seen_match_keys:
+                return _skip_with_latency("duplicate_match_key", match_key=match_key)
+            self._seen_match_keys.add(match_key)
+            self.accepted += 1
 
         source = str(payload.get("source") or "").strip().lower()
         if source and source not in self.cfg.actionable_sources:
@@ -346,6 +398,19 @@ class BuyExecutor:
         if not token_id:
             return _skip_with_latency("missing_token_id")
 
+        now_unix = time.time()
+        if self.cfg.fak_no_match_cooldown_seconds > 0:
+            with self._state_lock:
+                cooldown_until = float(self._fak_no_match_cooldown_until.get(token_id, 0.0) or 0.0)
+                if cooldown_until > 0 and cooldown_until <= now_unix:
+                    self._fak_no_match_cooldown_until.pop(token_id, None)
+            if cooldown_until > now_unix:
+                return _skip_with_latency(
+                    "fak_no_match_cooldown",
+                    token_id=token_id,
+                    cooldown_remaining_seconds=round(cooldown_until - now_unix, 4),
+                )
+
         matched_live_market: Optional[Dict[str, Any]] = self._find_matching_live_market(signal, list(live_markets or []))
         if self.cfg.actionable_require_live_market_match:
             if matched_live_market is None:
@@ -366,26 +431,6 @@ class BuyExecutor:
 
         condition_id = str(signal.get("condition_id") or "").strip().lower()
         market_key = condition_id or str(signal.get("slug") or "").strip().lower() or token_id
-
-        spent_market = self._spent_market.get(market_key, 0.0)
-        spent_token = self._spent_token.get(token_id, 0.0)
-
-        if self.cfg.max_usdc_per_market > 0 and spent_market + requested_usdc > self.cfg.max_usdc_per_market + 1e-12:
-            return _skip_with_latency(
-                "market_budget_exceeded",
-                market_key=market_key,
-                spent_market=round(spent_market, 6),
-                requested_usdc=round(requested_usdc, 6),
-                max_usdc_per_market=self.cfg.max_usdc_per_market,
-            )
-        if self.cfg.max_usdc_per_token > 0 and spent_token + requested_usdc > self.cfg.max_usdc_per_token + 1e-12:
-            return _skip_with_latency(
-                "token_budget_exceeded",
-                token_id=token_id,
-                spent_token=round(spent_token, 6),
-                requested_usdc=round(requested_usdc, 6),
-                max_usdc_per_token=self.cfg.max_usdc_per_token,
-            )
 
         pricing_reference = "source_price"
         quote: Optional[Dict[str, Any]] = None
@@ -456,21 +501,69 @@ class BuyExecutor:
             decision["decision_latency_ms"] = round((time.perf_counter() - decision_started) * 1000.0, 3)
             return decision
 
-        if self.client is None:
-            self.errors += 1
-            decision["status"] = "error"
-            decision["error"] = "trading_client_unavailable"
-            decision["decision_latency_ms"] = round((time.perf_counter() - decision_started) * 1000.0, 3)
-            return decision
-
         if _MarketOrderArgs is None:
-            self.errors += 1
+            with self._state_lock:
+                self.errors += 1
             decision["status"] = "error"
             decision["error"] = f"py_clob_client_types_unavailable: {_CLOB_IMPORT_ERROR}"
             decision["decision_latency_ms"] = round((time.perf_counter() - decision_started) * 1000.0, 3)
             return decision
 
+        client = self.client
+        if client is None:
+            try:
+                client = self._get_thread_client()
+            except Exception as exc:
+                with self._state_lock:
+                    self.errors += 1
+                decision["status"] = "error"
+                decision["error"] = str(exc) or "trading_client_unavailable"
+                decision["decision_latency_ms"] = round((time.perf_counter() - decision_started) * 1000.0, 3)
+                return decision
+
+        reservation_applied = False
+        commit_spend = False
         try:
+            budget_skip_reason: Optional[str] = None
+            budget_skip_meta: Dict[str, Any] = {}
+            with self._state_lock:
+                spent_market = self._spent_market.get(market_key, 0.0)
+                spent_token = self._spent_token.get(token_id, 0.0)
+                reserved_market = self._reserved_market.get(market_key, 0.0)
+                reserved_token = self._reserved_token.get(token_id, 0.0)
+
+                if (
+                    self.cfg.max_usdc_per_market > 0
+                    and spent_market + reserved_market + requested_usdc > self.cfg.max_usdc_per_market + 1e-12
+                ):
+                    budget_skip_reason = "market_budget_exceeded"
+                    budget_skip_meta = {
+                        "market_key": market_key,
+                        "spent_market": round(spent_market, 6),
+                        "reserved_market": round(reserved_market, 6),
+                        "requested_usdc": round(requested_usdc, 6),
+                        "max_usdc_per_market": self.cfg.max_usdc_per_market,
+                    }
+                elif (
+                    self.cfg.max_usdc_per_token > 0
+                    and spent_token + reserved_token + requested_usdc > self.cfg.max_usdc_per_token + 1e-12
+                ):
+                    budget_skip_reason = "token_budget_exceeded"
+                    budget_skip_meta = {
+                        "token_id": token_id,
+                        "spent_token": round(spent_token, 6),
+                        "reserved_token": round(reserved_token, 6),
+                        "requested_usdc": round(requested_usdc, 6),
+                        "max_usdc_per_token": self.cfg.max_usdc_per_token,
+                    }
+                else:
+                    self._reserved_market[market_key] = reserved_market + requested_usdc
+                    self._reserved_token[token_id] = reserved_token + requested_usdc
+                    reservation_applied = True
+
+            if budget_skip_reason is not None:
+                return _skip_with_latency(budget_skip_reason, **budget_skip_meta)
+
             submit_started = time.perf_counter()
             retry_enabled = (
                 self.cfg.order_type == "FAK"
@@ -506,8 +599,8 @@ class BuyExecutor:
                         price=round(worst_price, 9),
                         order_type=self.cfg.order_type,  # type: ignore[arg-type]
                     )
-                    signed_order = self.client.create_market_order(order_args)
-                    response = self.client.post_order(signed_order, orderType=self.cfg.order_type)
+                    signed_order = client.create_market_order(order_args)
+                    response = client.post_order(signed_order, orderType=self.cfg.order_type)
                     attempt_latencies_ms.append(round((time.perf_counter() - attempt_started) * 1000.0, 3))
 
                     decision["status"] = "submitted"
@@ -521,9 +614,7 @@ class BuyExecutor:
                     decision["submit_attempt_latencies_ms"] = attempt_latencies_ms
                     decision["submit_latency_ms"] = round((time.perf_counter() - submit_started) * 1000.0, 3)
                     decision["decision_latency_ms"] = round((time.perf_counter() - decision_started) * 1000.0, 3)
-                    self.submitted += 1
-                    self._spent_market[market_key] = spent_market + requested_usdc
-                    self._spent_token[token_id] = spent_token + requested_usdc
+                    commit_spend = True
                     return decision
                 except Exception as exc:
                     final_exc = exc
@@ -556,11 +647,18 @@ class BuyExecutor:
 
             all_no_match = retryable_no_match_count > 0 and retryable_no_match_count >= submit_attempts
             if all_no_match:
-                self.skipped += 1
+                with self._state_lock:
+                    self.skipped += 1
                 decision["status"] = "no_fill"
                 decision["reason"] = "fak_no_match_exhausted"
+                cooldown_seconds = float(self.cfg.fak_no_match_cooldown_seconds)
+                if cooldown_seconds > 0:
+                    with self._state_lock:
+                        self._fak_no_match_cooldown_until[token_id] = time.time() + cooldown_seconds
+                    decision["fak_no_match_cooldown_seconds"] = round(cooldown_seconds, 6)
             else:
-                self.errors += 1
+                with self._state_lock:
+                    self.errors += 1
                 decision["status"] = "error"
             decision["error"] = str(final_exc) if final_exc is not None else "order_submit_failed"
             decision["submit_attempts"] = submit_attempts
@@ -578,24 +676,58 @@ class BuyExecutor:
             decision["decision_latency_ms"] = round((time.perf_counter() - decision_started) * 1000.0, 3)
             return decision
         except Exception as exc:
-            self.errors += 1
+            with self._state_lock:
+                self.errors += 1
             decision["status"] = "error"
             decision["error"] = str(exc)
             decision["decision_latency_ms"] = round((time.perf_counter() - decision_started) * 1000.0, 3)
             return decision
+        finally:
+            if reservation_applied:
+                with self._state_lock:
+                    next_market_reserved = self._reserved_market.get(market_key, 0.0) - requested_usdc
+                    if next_market_reserved > 1e-12:
+                        self._reserved_market[market_key] = next_market_reserved
+                    else:
+                        self._reserved_market.pop(market_key, None)
+
+                    next_token_reserved = self._reserved_token.get(token_id, 0.0) - requested_usdc
+                    if next_token_reserved > 1e-12:
+                        self._reserved_token[token_id] = next_token_reserved
+                    else:
+                        self._reserved_token.pop(token_id, None)
+
+                    if commit_spend:
+                        self.submitted += 1
+                        self._spent_market[market_key] = self._spent_market.get(market_key, 0.0) + requested_usdc
+                        self._spent_token[token_id] = self._spent_token.get(token_id, 0.0) + requested_usdc
+                        self._fak_no_match_cooldown_until.pop(token_id, None)
 
     def snapshot(self) -> Dict[str, Any]:
-        spent_market_total = sum(self._spent_market.values())
-        spent_token_total = sum(self._spent_token.values())
+        with self._state_lock:
+            accepted = self.accepted
+            submitted = self.submitted
+            skipped = self.skipped
+            errors = self.errors
+            api_creds_source = self.api_creds_source
+            seen_match_keys = len(self._seen_match_keys)
+            spent_market_total = sum(self._spent_market.values())
+            spent_token_total = sum(self._spent_token.values())
+            reserved_market_total = sum(self._reserved_market.values())
+            reserved_token_total = sum(self._reserved_token.values())
+            meta_prefetch_ok = self.meta_prefetch_ok
+            meta_prefetch_errors = self.meta_prefetch_errors
         return {
-            "accepted": self.accepted,
-            "submitted": self.submitted,
-            "skipped": self.skipped,
-            "errors": self.errors,
-            "api_creds_source": self.api_creds_source,
-            "seen_match_keys": len(self._seen_match_keys),
+            "accepted": accepted,
+            "submitted": submitted,
+            "skipped": skipped,
+            "errors": errors,
+            "api_creds_source": api_creds_source,
+            "seen_match_keys": seen_match_keys,
             "spent_market_total_usdc": round(spent_market_total, 6),
             "spent_token_total_usdc": round(spent_token_total, 6),
-            "meta_prefetch_ok": self.meta_prefetch_ok,
-            "meta_prefetch_errors": self.meta_prefetch_errors,
+            "reserved_market_total_usdc": round(reserved_market_total, 6),
+            "reserved_token_total_usdc": round(reserved_token_total, 6),
+            "meta_prefetch_ok": meta_prefetch_ok,
+            "meta_prefetch_errors": meta_prefetch_errors,
         }

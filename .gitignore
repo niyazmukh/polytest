@@ -17,3 +17,17 @@ __pycache__/
 v2_hybrid_signals/live_pipeline_*.jsonl
 v2_hybrid_signals/live_pipeline_*.err
 v2_hybrid_signals/live_pipeline_*_meta.json
+
+# Local analysis/runtime artifacts
+_tmp_*
+_analyze_*.py
+
+# Local collected datasets (large, generated)
+v4_data/
+
+# Generated v5 investigation outputs
+v5/report_*.json
+v5/cluster_wallets_*.csv
+v5/cluster_wallets_*.html
+v5/cluster_wallets_*.json
+v5/cluster_wallets_*.md

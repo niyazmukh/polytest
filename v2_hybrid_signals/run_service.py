@@ -91,9 +91,10 @@ class ServiceRunner:
     ) -> None:
         self.stop_event = threading.Event()
         self._live_markets_lock = threading.Lock()
+        self._metrics_lock = threading.Lock()
         self.live_markets: List[Dict[str, Any]] = []
         self._actionable_queue: "Queue[Dict[str, Any]]" = Queue(maxsize=20_000)
-        self._buy_worker: Optional[threading.Thread] = None
+        self._buy_workers: List[threading.Thread] = []
         self.actionable_enqueued = 0
         self.actionable_processed = 0
         self.actionable_dropped = 0
@@ -184,9 +185,11 @@ class ServiceRunner:
             queued = dict(payload)
             queued["_enqueued_at_unix"] = time.time()
             self._actionable_queue.put_nowait(queued)
-            self.actionable_enqueued += 1
+            with self._metrics_lock:
+                self.actionable_enqueued += 1
         except Full:
-            self.actionable_dropped += 1
+            with self._metrics_lock:
+                self.actionable_dropped += 1
             _emit(
                 {
                     "event": "BUY_ENGINE_QUEUE_DROP",
@@ -220,7 +223,8 @@ class ServiceRunner:
                 with self._live_markets_lock:
                     live_markets = list(self.live_markets)
                 decision = self.buy_executor.process_actionable(payload, live_markets=live_markets)
-                self.actionable_processed += 1
+                with self._metrics_lock:
+                    self.actionable_processed += 1
                 _emit(
                     {
                         "event": "BUY_ENGINE_DECISION",
@@ -234,7 +238,8 @@ class ServiceRunner:
                     }
                 )
             except Exception as exc:
-                self.actionable_errors += 1
+                with self._metrics_lock:
+                    self.actionable_errors += 1
                 _emit({"event": "BUY_ENGINE_FATAL", "error": str(exc), "where": "run_service_buy_worker"})
             finally:
                 self._actionable_queue.task_done()
@@ -282,6 +287,8 @@ class ServiceRunner:
             "buy_fak_retry_max_attempts": self.buy_cfg.fak_retry_max_attempts,
             "buy_fak_retry_delay_seconds": self.buy_cfg.fak_retry_delay_seconds,
             "buy_fak_retry_max_window_seconds": self.buy_cfg.fak_retry_max_window_seconds,
+            "buy_fak_no_match_cooldown_seconds": self.buy_cfg.fak_no_match_cooldown_seconds,
+            "buy_worker_threads": self.buy_cfg.worker_threads,
             "buy_require_market_open": self.buy_cfg.require_market_open,
             "buy_market_close_guard_seconds": self.buy_cfg.market_close_guard_seconds,
             "buy_quote_wait_timeout_seconds": self.buy_cfg.quote_wait_timeout_seconds,
@@ -300,12 +307,15 @@ class ServiceRunner:
 
         # Start price feed (WebSocket + REST book polling).
         self.price_feed.start()
-        self._buy_worker = threading.Thread(
-            target=self._buy_worker_loop,
-            name="buy-worker",
-            daemon=True,
-        )
-        self._buy_worker.start()
+        self._buy_workers = []
+        for idx in range(max(1, int(self.buy_cfg.worker_threads))):
+            worker = threading.Thread(
+                target=self._buy_worker_loop,
+                name=f"buy-worker-{idx + 1}",
+                daemon=True,
+            )
+            self._buy_workers.append(worker)
+            worker.start()
 
         # Start redeem in background daemon thread (if configured).
         redeem_thread: Optional[threading.Thread] = None
@@ -321,23 +331,28 @@ class ServiceRunner:
             exit_code = self.detector.run()
         finally:
             self.stop_event.set()
-            if self._buy_worker is not None:
-                self._buy_worker.join(timeout=10.0)
+            for worker in self._buy_workers:
+                worker.join(timeout=10.0)
             self.price_feed.join(timeout=3.0)
             if self.redeem_worker is not None:
                 self.redeem_worker.close()
             if redeem_thread is not None:
                 redeem_thread.join(timeout=5.0)
+            with self._metrics_lock:
+                enqueued = self.actionable_enqueued
+                processed = self.actionable_processed
+                dropped = self.actionable_dropped
+                errors = self.actionable_errors
             _emit({
                 "event": "SERVICE_STOP",
                 "exit_code": exit_code,
                 "buy_executor": self.buy_executor.snapshot(),
                 "price_feed": self.price_feed.snapshot(),
                 "buy_queue": {
-                    "enqueued": self.actionable_enqueued,
-                    "processed": self.actionable_processed,
-                    "dropped": self.actionable_dropped,
-                    "errors": self.actionable_errors,
+                    "enqueued": enqueued,
+                    "processed": processed,
+                    "dropped": dropped,
+                    "errors": errors,
                     "pending": self._actionable_queue.qsize(),
                 },
                 "redeem_disabled_reason": self.redeem_disabled_reason,

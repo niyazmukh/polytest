@@ -9,6 +9,7 @@ from .config_helpers import (
     bootstrap_env_file,
     env_bool,
     env_float,
+    env_int,
     reload_env_file_if_changed,
 )
 
@@ -180,11 +181,15 @@ def parse_args(argv: _Argv = None) -> HybridConfig:
     parser.add_argument("--gamma-warmup-pages", type=int, default=2)
     parser.add_argument("--gamma-warmup-page-size", type=int, default=500)
 
-    parser.add_argument("--live-market-symbol", default="btc")
-    parser.add_argument("--live-market-timeframe-minutes", type=int, default=5)
+    parser.add_argument("--live-market-symbol", default=os.environ.get("LIVE_MARKET_SYMBOL", "btc"))
+    parser.add_argument(
+        "--live-market-timeframe-minutes",
+        type=int,
+        default=env_int("LIVE_MARKET_TIMEFRAME_MINUTES", 5),
+    )
     parser.add_argument(
         "--live-market-timeframes-minutes",
-        default="5,15",
+        default=os.environ.get("LIVE_MARKET_TIMEFRAMES_MINUTES", "5,15,60"),
         help="comma-separated list of timeframes to track (must include primary timeframe)",
     )
     parser.add_argument("--live-market-refresh-interval-seconds", type=float, default=1.0)
